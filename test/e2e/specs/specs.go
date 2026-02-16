@@ -255,8 +255,9 @@ func (t *TestPod) VerifyExecInPodSucceedWithFullOutput(f *framework.Framework, c
 }
 
 // VerifyExecInPodFail verifies shell cmd in target pod fail with certain exit code.
+// Uses a single exec (no retry) since we expect the command to fail.
 func (t *TestPod) VerifyExecInPodFail(f *framework.Framework, containerName, shExec string, exitCode int) {
-	stdout, stderr, err := execCommandInContainerWithFullOutputWithRetry(f, t.pod.Name, containerName, "/bin/sh", "-c", shExec)
+	stdout, stderr, err := e2epod.ExecCommandInContainerWithFullOutput(f, t.pod.Name, containerName, "/bin/sh", "-c", shExec)
 	gomega.Expect(err).Should(gomega.HaveOccurred(),
 		fmt.Sprintf("%q should fail with exit code %d, but exit without error\nstdout: %s\nstderr: %s", shExec, exitCode, stdout, stderr))
 }

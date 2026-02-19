@@ -141,8 +141,8 @@ func NewTestPodModifiedSpec(c clientset.Interface, ns *corev1.Namespace, setAuto
 }
 
 func NewTestPod(c clientset.Interface, ns *corev1.Namespace) *TestPod {
-	cpu, _ := resource.ParseQuantity("100m")
-	mem, _ := resource.ParseQuantity("20Mi")
+	cpu, _ := resource.ParseQuantity("500m")
+	mem, _ := resource.ParseQuantity("256Mi")
 
 	return &TestPod{
 		client:    c,
@@ -167,10 +167,14 @@ func NewTestPod(c clientset.Interface, ns *corev1.Namespace) *TestPod {
 				ServiceAccountName:            K8sServiceAccountName,
 				Containers: []corev1.Container{
 					{
-						Name:         TesterContainerName,
-						Image:        imageutils.GetE2EImage(imageutils.BusyBox),
-						Command:      []string{"/bin/sh"},
-						Args:         []string{"-c", "tail -f /dev/null"},
+						Name:    TesterContainerName,
+						Image:   "debian:stable-slim",
+						Command: []string{"/bin/sh"},
+						Args: []string{
+							"-c",
+							"apt-get update && apt-get install -y curl wget iputils-ping dnsutils ca-certificates && update-ca-certificates && ls -l /etc/ssl/certs/ && sleep infinity",
+						},
+
 						VolumeMounts: make([]corev1.VolumeMount, 0),
 						Resources: corev1.ResourceRequirements{
 							Limits: corev1.ResourceList{

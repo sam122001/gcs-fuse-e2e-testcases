@@ -326,26 +326,33 @@ func (t *gcsFuseCSIHostNetworkTestSuite) DefineTests(driver storageframework.Tes
 		tPod.Create(ctx)
 		tPod.WaitForRunning(ctx)
 
-		//
 		// Check nameservers
-		//
 		resolv := tPod.VerifyExecInPodSucceedWithOutput(
 			f, "volume-tester", "cat /etc/resolv.conf | grep nameserver",
 		)
 		gomega.Expect(resolv).ToNot(gomega.BeEmpty())
 
-		domains := []string{
-			"www.googleapis.com/discovery/v1/apis",
+		// Define domain + URL pairs properly
+		testTargets := []struct {
+			host string
+			url  string
+		}{
+			{
+				host: "www.googleapis.com",
+				url:  "https://www.googleapis.com/discovery/v1/apis",
+			},
 		}
 
-		for _, domain := range domains {
+		for _, t := range testTargets {
 
-			ginkgo.By(fmt.Sprintf("Resolving %s using ping", domain))
-			pingCmd := fmt.Sprintf("ping -c1 %s >/dev/null 2>&1", "www.googleapis.com")
+			// Ping hostname
+			ginkgo.By(fmt.Sprintf("Resolving %s using ping", t.host))
+			pingCmd := fmt.Sprintf("ping -c1 %s >/dev/null 2>&1", t.host)
 			tPod.VerifyExecInPodSucceed(f, "volume-tester", pingCmd)
 
-			ginkgo.By(fmt.Sprintf("Checking HTTPS connectivity to %s using curl", domain))
-			curlCmd := fmt.Sprintf("curl -s -o /dev/null -w '%%{http_code}' https://%s", domain)
+			// Curl URL
+			ginkgo.By(fmt.Sprintf("Checking HTTPS connectivity to %s using curl", t.url))
+			curlCmd := fmt.Sprintf("curl -s -o /dev/null -w '%%{http_code}' %s", t.url)
 			httpCode := tPod.VerifyExecInPodSucceedWithOutput(f, "volume-tester", curlCmd)
 			gomega.Expect(httpCode).To(gomega.Equal("200"))
 		}

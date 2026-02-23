@@ -279,6 +279,4 @@ func (t *gcsFuseCSINodeDriverRestartTestSuite) DefineTests(driver storageframewo
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo ok > %v/data && grep ok %v/data", mountPath, mountPath))
 	})
-	
-
 }

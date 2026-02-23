@@ -29,6 +29,7 @@ import (
 
 	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/util"
 	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/webhook"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -1303,6 +1304,57 @@ func (t *TestPod) getDriverLogs() (string, string, error) {
 	}
 
 	return stdout, stderr, nil
+}
+
+// getDriverNamespace returns the namespace where the CSI node driver DaemonSet runs (OSS vs managed).
+func getDriverNamespace() string {
+	if os.Getenv(IsOSSEnvVar) == "true" {
+		return driverNamespaceOSS
+	}
+	return driverNamespaceManaged
+}
+
+// RestartNodeDriverOnNode deletes the CSI node driver pod on the given node and waits for a new one to be Running and Ready.
+// Used by e2e tests to simulate node driver restart without rebooting the node.
+func RestartNodeDriverOnNode(ctx context.Context, c clientset.Interface, nodeName string) {
+	ns := getDriverNamespace()
+	pods, err := c.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
+		LabelSelector: driverDaemonsetLabel,
+		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", nodeName).String(),
+	})
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	gomega.Expect(pods.Items).NotTo(gomega.BeEmpty(), "no CSI node driver pod on node %s", nodeName)
+
+	driverPod := pods.Items[0]
+
+	ginkgo.By("Deleting the CSI node driver pod on node " + nodeName)
+	err = c.CoreV1().Pods(ns).Delete(ctx, driverPod.Name, metav1.DeleteOptions{})
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+	ginkgo.By("Waiting for a new CSI node driver pod to become Ready on node " + nodeName)
+	gomega.Eventually(func() bool {
+		pods, err := c.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
+			LabelSelector: driverDaemonsetLabel,
+			FieldSelector: fields.OneTermEqualSelector("spec.nodeName", nodeName).String(),
+		})
+		if err != nil || len(pods.Items) == 0 {
+			return false
+		}
+		for _, pod := range pods.Items {
+			if pod.Name == driverPod.Name {
+				continue // old pod still terminating
+			}
+			if pod.Status.Phase != corev1.PodRunning {
+				continue
+			}
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+					return true
+				}
+			}
+		}
+		return false
+	}).WithContext(ctx).WithTimeout(pollTimeoutSlow).WithPolling(pollInterval).Should(gomega.BeTrue())
 }
 
 func runKubectlWithFullOutputWithRetry(namespace string, args ...string) (string, string, error) {

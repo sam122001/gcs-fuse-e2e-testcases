@@ -20,19 +20,14 @@ package testsuites
 import (
 	"context"
 	"fmt"
-	"os"
-	"strconv"
 	"time"
 
 	"local/test/e2e/specs"
-	"local/test/e2e/utils"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
@@ -64,11 +59,6 @@ func (t *gcsFuseCSINodeDriverRestartTestSuite) SkipUnsupportedTests(_ storagefra
 }
 
 func (t *gcsFuseCSINodeDriverRestartTestSuite) DefineTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
-	envVar := os.Getenv(utils.TestWithNativeSidecarEnvVar)
-	supportsNativeSidecar, err := strconv.ParseBool(envVar)
-	if err != nil {
-		klog.Fatalf(`env variable %q could not be converted to boolean`, utils.TestWithNativeSidecarEnvVar)
-	}
 
 	type local struct {
 		config             *storageframework.PerTestConfig
@@ -289,5 +279,6 @@ func (t *gcsFuseCSINodeDriverRestartTestSuite) DefineTests(driver storageframewo
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo ok > %v/data && grep ok %v/data", mountPath, mountPath))
 	})
+	
 
 }

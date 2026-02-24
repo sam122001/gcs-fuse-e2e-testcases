@@ -20,16 +20,22 @@ package testsuites
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"time"
 
 	"local/test/e2e/specs"
+	"local/test/e2e/utils"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
 	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
 	admissionapi "k8s.io/pod-security-admission/api"
@@ -59,6 +65,11 @@ func (t *gcsFuseCSINodeDriverRestartTestSuite) SkipUnsupportedTests(_ storagefra
 }
 
 func (t *gcsFuseCSINodeDriverRestartTestSuite) DefineTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
+	envVar := os.Getenv(utils.TestWithNativeSidecarEnvVar)
+	supportsNativeSidecar, err := strconv.ParseBool(envVar)
+	if err != nil {
+		klog.Fatalf(`env variable "%s" could not be converted to boolean`, utils.TestWithNativeSidecarEnvVar)
+	}
 
 	type local struct {
 		config             *storageframework.PerTestConfig
@@ -278,5 +289,122 @@ func (t *gcsFuseCSINodeDriverRestartTestSuite) DefineTests(driver storageframewo
 		ginkgo.By("Verifying mount and read/write")
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo ok > %v/data && grep ok %v/data", mountPath, mountPath))
+	})
+
+	// Node driver restarts while metadata prefetch is in use: after restart, metadata should be
+	// rebuilt correctly and not return stale results.
+	ginkgo.It("[metadata prefetch] should rebuild metadata correctly after node driver restart and not return stale results", func() {
+		if !supportsNativeSidecar {
+			e2eskipper.Skipf("metadata prefetch requires native sidecar")
+		}
+		init(1, specs.EnableMetadataPrefetchPrefix)
+		defer cleanup()
+
+		ginkgo.By("Creating pod with metadata prefetch volume")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+
+		tPod.WaitForRunning(ctx)
+
+		ginkgo.By("Writing file and triggering metadata (ls, stat)")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo before-restart > %v/prefetch-test", mountPath))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("ls -la %v && stat %v/prefetch-test", mountPath, mountPath))
+
+		ginkgo.By("Restarting CSI node driver on the node")
+		specs.RestartNodeDriverOnNode(ctx, f.ClientSet, tPod.GetNode())
+
+		ginkgo.By("Verifying metadata is correct after restart (no stale results)")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep before-restart %v/prefetch-test", mountPath))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("ls -la %v | grep prefetch-test", mountPath))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo after-restart >> %v/prefetch-test && grep after-restart %v/prefetch-test", mountPath, mountPath))
+	})
+
+	// Node driver restarts under resource pressure: run moderate CPU load on the same node,
+	// restart the node driver, then verify the workload pod still has a valid mount and can do I/O.
+	ginkgo.It("[Disruptive] should recover when node driver restarts under moderate CPU load on the node", func() {
+		init(1)
+		defer cleanup()
+
+		ginkgo.By("Creating pod with GCS FUSE volume")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+
+		tPod.WaitForRunning(ctx)
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo before-stress > %v/data", mountPath))
+
+		ginkgo.By("Creating stress pod on same node to apply moderate CPU load")
+		stressPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "node-driver-restart-stress",
+				Namespace: f.Namespace.Name,
+			},
+			Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				NodeName:      tPod.GetNode(),
+				Containers: []corev1.Container{
+					{
+						Name:    "stress",
+						Image:   specs.UbuntuImage,
+						Command: []string{"/bin/bash", "-c", "for i in $(seq 1 90); do dd if=/dev/zero of=/dev/null bs=1M count=50 2>/dev/null; sleep 1; done"},
+					},
+				},
+			},
+		}
+		_, createErr := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, stressPod, metav1.CreateOptions{})
+		framework.ExpectNoError(createErr)
+		defer func() {
+			_ = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, stressPod.Name, metav1.DeleteOptions{})
+		}()
+
+		ginkgo.By("Waiting for stress pod to be running")
+		framework.ExpectNoError(e2epod.WaitTimeoutForPodRunningInNamespace(ctx, f.ClientSet, stressPod.Name, f.Namespace.Name, 1*time.Minute))
+
+		ginkgo.By("Restarting CSI node driver while node is under load")
+		specs.RestartNodeDriverOnNode(ctx, f.ClientSet, tPod.GetNode())
+
+		ginkgo.By("Verifying workload pod still has valid mount and can read/write")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep before-stress %v/data", mountPath))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo after-stress >> %v/data && grep after-stress %v/data", mountPath, mountPath))
+	})
+
+	// After node driver restart, unmount (delete pod) then mount a new pod on the same node.
+	// Ensures clean teardown and that new pods can mount volumes on the node after a restart (critical for rescheduling).
+	ginkgo.It("should allow pod to unmount and new pod to mount on same node after node driver restart", func() {
+		init(2)
+		defer cleanup()
+
+		ginkgo.By("Creating first pod with GCS FUSE volume")
+		tPod1 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod1.SetupVolume(l.volumeResourceList[0], volumeName, mountPath, false)
+		tPod1.Create(ctx)
+		tPod1.WaitForRunning(ctx)
+
+		ginkgo.By("Verifying first pod mount and read/write")
+		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo first-pod > %v/data && grep first-pod %v/data", mountPath, mountPath))
+
+		ginkgo.By("Restarting CSI node driver on the node")
+		specs.RestartNodeDriverOnNode(ctx, f.ClientSet, tPod1.GetNode())
+		nodeName := tPod1.GetNode()
+
+		ginkgo.By("Deleting first pod (unmount) so node driver performs cleanup")
+		tPod1.Cleanup(ctx)
+
+		ginkgo.By("Creating second pod with new volume on same node")
+		tPod2 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod2.SetupVolume(l.volumeResourceList[1], volumeName, mountPath, false)
+		tPod2.SetNodeAffinity(nodeName, true)
+		tPod2.Create(ctx)
+		defer tPod2.Cleanup(ctx)
+		tPod2.WaitForRunning(ctx)
+
+		ginkgo.By("Verifying second pod has valid mount and can read/write")
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo second-pod > %v/data && grep second-pod %v/data", mountPath, mountPath))
 	})
 }

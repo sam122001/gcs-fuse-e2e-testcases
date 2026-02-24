@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -1355,6 +1356,98 @@ func RestartNodeDriverOnNode(ctx context.Context, c clientset.Interface, nodeNam
 		}
 		return false
 	}).WithContext(ctx).WithTimeout(pollTimeoutSlow).WithPolling(pollInterval).Should(gomega.BeTrue())
+}
+
+// CountReadyNodes returns the number of nodes that have Ready condition true.
+// Exposed for e2e tests that need to skip when the cluster has too few nodes.
+func CountReadyNodes(ctx context.Context, c clientset.Interface) (int, error) {
+	return countReadyNodes(ctx, c)
+}
+
+func countReadyNodes(ctx context.Context, c clientset.Interface) (int, error) {
+	nodeList, err := c.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return 0, err
+	}
+	var count int
+	for _, n := range nodeList.Items {
+		for _, cond := range n.Status.Conditions {
+			if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
+				count++
+				break
+			}
+		}
+	}
+	return count, nil
+}
+
+// DrainNodeAndRestartNode drains the given node, reboots it via gcloud (same VM, no delete),
+// then waits for the same node to become Ready and for the CSI node driver to be Ready on it.
+// Requires gcloud to be installed and the node to have label topology.kubernetes.io/zone (or
+// failure-domain.beta.kubernetes.io/zone). On GKE the node name is used as the GCE instance name.
+func DrainNodeAndRestartNode(ctx context.Context, c clientset.Interface, nodeName string) {
+	node, err := c.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+	zone := node.Labels["topology.kubernetes.io/zone"]
+	if zone == "" {
+		zone = node.Labels["failure-domain.beta.kubernetes.io/zone"]
+	}
+	gomega.Expect(zone).NotTo(gomega.BeEmpty(), "node %s must have zone label (topology.kubernetes.io/zone or failure-domain.beta.kubernetes.io/zone)", nodeName)
+
+	ginkgo.By("Draining node " + nodeName)
+	_, _, drainErr := e2ekubectl.RunKubectlWithFullOutput("", "drain", nodeName,
+		"--ignore-daemonsets", "--delete-emptydir-data", "--force",
+		"--grace-period=60", "--timeout=300s")
+	gomega.Expect(drainErr).NotTo(gomega.HaveOccurred())
+
+	ginkgo.By("Restarting (rebooting) node " + nodeName + " via gcloud compute instances reset")
+	cmd := exec.CommandContext(ctx, "gcloud", "compute", "instances", "reset", nodeName, "--zone="+zone)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	resetErr := cmd.Run()
+	gomega.Expect(resetErr).NotTo(gomega.HaveOccurred(), "gcloud compute instances reset failed for node %s in zone %s", nodeName, zone)
+
+	ginkgo.By("Waiting for node " + nodeName + " to become Ready again")
+	gomega.Eventually(func() bool {
+		n, err := c.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		for _, cond := range n.Status.Conditions {
+			if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
+				return true
+			}
+		}
+		return false
+	}).WithContext(ctx).WithTimeout(pollTimeoutSlow).WithPolling(pollInterval).Should(gomega.BeTrue())
+
+	ginkgo.By("Waiting for CSI node driver to be Ready on node " + nodeName)
+	ns := getDriverNamespace()
+	gomega.Eventually(func() bool {
+		pods, err := c.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
+			LabelSelector: driverDaemonsetLabel,
+			FieldSelector: fields.OneTermEqualSelector("spec.nodeName", nodeName).String(),
+		})
+		if err != nil || len(pods.Items) == 0 {
+			return false
+		}
+		for _, p := range pods.Items {
+			if p.Status.Phase != corev1.PodRunning {
+				continue
+			}
+			for _, cond := range p.Status.Conditions {
+				if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+					return true
+				}
+			}
+		}
+		return false
+	}).WithContext(ctx).WithTimeout(pollTimeoutSlow).WithPolling(pollInterval).Should(gomega.BeTrue())
+
+	ginkgo.By("Uncordoning node " + nodeName + " so it can accept new pods")
+	_, _, uncordonErr := e2ekubectl.RunKubectlWithFullOutput("", "uncordon", nodeName)
+	gomega.Expect(uncordonErr).NotTo(gomega.HaveOccurred())
 }
 
 func runKubectlWithFullOutputWithRetry(namespace string, args ...string) (string, string, error) {

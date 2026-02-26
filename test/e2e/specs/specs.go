@@ -328,6 +328,23 @@ func (t *TestPod) WaitForRunning(ctx context.Context) {
 	framework.ExpectNoError(err)
 }
 
+// WaitForPodScheduled waits until the pod has been scheduled (Spec.NodeName is set). It refreshes t.pod.
+// Use when the pod should be scheduled but may not have completed mount yet (e.g. before triggering node drain).
+func (t *TestPod) WaitForPodScheduled(ctx context.Context) {
+	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		p, err := t.client.CoreV1().Pods(t.namespace.Name).Get(ctx, t.pod.Name, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		if p.Spec.NodeName == "" {
+			return false, nil
+		}
+		t.pod = p
+		return true, nil
+	})
+	framework.ExpectNoError(err, "pod %s did not get scheduled (no node name) within timeout", t.pod.Name)
+}
+
 // FindLogsByNewLine scans the log string and returns the line
 // containing the given logToFind.
 func (t *TestPod) FindLogsByNewLine(logToFind string) (string, error) {
@@ -408,6 +425,29 @@ func (t *TestPod) WaitForPodNotFoundInNamespace(ctx context.Context) {
 func (t *TestPod) WaitForLog(ctx context.Context, container string, expectedString string) {
 	_, err := lookForStringInLogWithoutKubectlWithRetry(ctx, t.client, t.namespace.Name, t.pod.Name, container, expectedString, pollTimeout)
 	framework.ExpectNoError(err)
+}
+
+// WaitForMountWritable polls until the mount at mountPath accepts writes (e.g. FUSE/sidecar ready).
+// Use after WaitForRunning when the first write can race with mount readiness (e.g. hostNetwork + KSA token sidecar).
+// Fails after writablePollTimeout so broken mounts don't burn test time; check sidecar logs if this times out.
+func (t *TestPod) WaitForMountWritable(ctx context.Context, f *framework.Framework, containerName, mountPath string) {
+	const writablePollInterval = 3 * time.Second
+	const writablePollTimeout = 45 * time.Second
+	canaryFile := mountPath + "/.e2e_writable_check"
+	writeCmd := fmt.Sprintf("echo ok > %s && grep -q ok %s && rm -f %s", canaryFile, canaryFile, canaryFile)
+	var attempt int
+	err := wait.PollUntilContextTimeout(ctx, writablePollInterval, writablePollTimeout, true, func(context.Context) (bool, error) {
+		attempt++
+		_, _, execErr := e2epod.ExecCommandInContainerWithFullOutput(f, t.pod.Name, containerName, "/bin/sh", "-c", writeCmd)
+		if execErr != nil {
+			if attempt <= 3 || attempt%5 == 0 {
+				framework.Logf("Mount not yet writable at %s (attempt %d): %v", mountPath, attempt, execErr)
+			}
+			return false, nil
+		}
+		return true, nil
+	})
+	framework.ExpectNoError(err, "mount at %s did not become writable within %v (pod %s); check gcsfuse sidecar logs if mount is failing", mountPath, writablePollTimeout, t.pod.Name)
 }
 
 func lookForStringInLogWithoutKubectlWithRetry(ctx context.Context, client clientset.Interface, namespace, podName, container, expectedString string, timeout time.Duration) (string, error) {
@@ -1448,6 +1488,29 @@ func DrainNodeAndRestartNode(ctx context.Context, c clientset.Interface, nodeNam
 	ginkgo.By("Uncordoning node " + nodeName + " so it can accept new pods")
 	_, _, uncordonErr := e2ekubectl.RunKubectlWithFullOutput("", "uncordon", nodeName)
 	gomega.Expect(uncordonErr).NotTo(gomega.HaveOccurred())
+}
+
+// DeleteGCSBucketForTest deletes a GCS bucket by name using gcloud. Used by e2e tests (e.g. delete-bucket-then-restart-node)
+// without modifying the test driver. Requires gcloud to be installed and authenticated.
+func DeleteGCSBucketForTest(ctx context.Context, bucketName string) error {
+	ginkgo.By(fmt.Sprintf("Deleting GCS bucket %q via gcloud", bucketName))
+	// First, remove all objects in the bucket (if any), then delete the bucket itself.
+	// This matches gcloud's recommendation when the bucket is not empty.
+
+	// Delete all objects (and subdirectories) in the bucket. Ignore errors here; bucket
+	// deletion below will surface any real problems.
+	rmCmd := exec.CommandContext(ctx, "gcloud", "storage", "rm", "-r", "gs://"+bucketName+"/**", "--quiet")
+	if output, err := rmCmd.CombinedOutput(); err != nil {
+		framework.Logf("gcloud storage rm -r for bucket %q returned error (ignored for cleanup): %v, output: %s", bucketName, err, string(output))
+	}
+
+	// Now delete the (now-empty) bucket.
+	delCmd := exec.CommandContext(ctx, "gcloud", "storage", "buckets", "delete", "gs://"+bucketName, "--quiet")
+	output, err := delCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gcloud storage buckets delete failed: %w (output: %s)", err, string(output))
+	}
+	return nil
 }
 
 func runKubectlWithFullOutputWithRetry(namespace string, args ...string) (string, string, error) {

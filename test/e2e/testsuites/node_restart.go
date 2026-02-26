@@ -20,13 +20,18 @@ package testsuites
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"local/test/e2e/specs"
 
+	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/webhook"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
+	"google.golang.org/grpc/codes"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
 	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
@@ -279,5 +284,221 @@ func (t *gcsFuseCSINodeRestartTestSuite) DefineTests(driver storageframework.Tes
 		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep vol2 %v/data2", mountPath2))
 		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo vol1-after >> %v/data1 && grep vol1-after %v/data1", mountPath, mountPath))
 		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo vol2-after >> %v/data2 && grep vol2-after %v/data2", mountPath2, mountPath2))
+	})
+
+	// Delete bucket → restart node → workload should fail to mount (no bucket recreation).
+	// Expected: Mount fails with 404 Bucket Not Found, CSI driver surfaces clean error,
+	// pod goes into CreateContainerError or MountVolume.SetUp failed.
+	ginkgo.It("[Disruptive] should fail to mount with 404 Bucket Not Found after bucket is deleted and node is restarted", func() {
+		readyNodes, err := specs.CountReadyNodes(ctx, f.ClientSet)
+		framework.ExpectNoError(err)
+		if readyNodes < 1 {
+			e2eskipper.Skipf("node restart test requires at least 1 ready node, got %d", readyNodes)
+		}
+
+		init(1)
+		defer cleanup()
+
+		ginkgo.By("Creating pod with GCS FUSE volume (PVC)")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+
+		tPod.WaitForRunning(ctx)
+		ginkgo.By("Verifying mount and writing data before node restart")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo before-delete > %v/data && grep before-delete %v/data", mountPath, mountPath))
+
+		nodeName := tPod.GetNode()
+		gomega.Expect(nodeName).NotTo(gomega.BeEmpty(), "pod should be scheduled and have node name")
+
+		bucketName := l.volumeResource.Pv.Spec.CSI.VolumeHandle
+		gomega.Expect(bucketName).NotTo(gomega.BeEmpty(), "volume handle (bucket name) must be set")
+
+		ginkgo.By("Draining and restarting the node (pod will be evicted)")
+		specs.DrainNodeAndRestartNode(ctx, f.ClientSet, nodeName)
+
+		ginkgo.By("Deleting the GCS bucket (no recreation)")
+		framework.ExpectNoError(specs.DeleteGCSBucketForTest(ctx, bucketName))
+
+		ginkgo.By("Creating new pod with same volume on the restarted node; mount should fail with 404 Bucket Not Found")
+		tPod2 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod2.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod2.SetNodeAffinity(nodeName, true)
+		tPod2.Create(ctx)
+		defer tPod2.Cleanup(ctx)
+
+		ginkgo.By("Expecting pod to fail mount: CSI driver should surface clean 404 / Bucket Not Found")
+		tPod2.WaitForFailedMountError(ctx, codes.NotFound.String())
+		tPod2.WaitForFailedMountError(ctx, "storage: bucket doesn't exist")
+	})
+
+	// GCSFuse cache consistency after restart: verify that cached files inside pod do not remain stale after remount.
+	// After node restart, a new pod mounting the same volume must see current GCS state (e.g. overwritten file content).
+	ginkgo.It("[Disruptive] should not serve stale cached data after node restart and remount", func() {
+		readyNodes, err := specs.CountReadyNodes(ctx, f.ClientSet)
+		framework.ExpectNoError(err)
+		if readyNodes < 1 {
+			e2eskipper.Skipf("node restart test requires at least 1 ready node, got %d", readyNodes)
+		}
+
+		gcsDriver, ok := driver.(*specs.GCSFuseCSITestDriver)
+		if !ok {
+			framework.Failf("driver must be GCSFuseCSITestDriver for cache consistency test")
+		}
+
+		init(1)
+		defer cleanup()
+
+		ginkgo.By("Creating pod with GCS FUSE volume and writing initial file content")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+		tPod.WaitForRunning(ctx)
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo cache-v1 > %v/cachefile && grep cache-v1 %v/cachefile", mountPath, mountPath))
+
+		nodeName := tPod.GetNode()
+		gomega.Expect(nodeName).NotTo(gomega.BeEmpty(), "pod should be scheduled and have node name")
+
+		ginkgo.By("Draining and restarting the node")
+		specs.DrainNodeAndRestartNode(ctx, f.ClientSet, nodeName)
+
+		bucketName := l.volumeResource.Pv.Spec.CSI.VolumeHandle
+		ginkgo.By("Overwriting file in GCS so new pod must not see stale cache")
+		gcsDriver.CreateTestFileInBucket(ctx, "cachefile", bucketName) // overwrites with content "cachefile" (test file name)
+
+		ginkgo.By("Creating new pod with same volume on restarted node")
+		tPod2 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod2.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod2.SetNodeAffinity(nodeName, true)
+		tPod2.Create(ctx)
+		defer tPod2.Cleanup(ctx)
+		tPod2.WaitForRunning(ctx)
+
+		ginkgo.By("Verifying new pod sees current GCS content (not stale cache from pre-restart)")
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep cachefile %v/cachefile", mountPath))
+	})
+
+	// Node restart while GCSFuse process is actively writing: pod writes large files continuously, node restarts.
+	// Expected: No corrupted objects in GCS; remounted pod can resume writes; partial writes must not leave partial/malformed objects.
+	ginkgo.It("[Disruptive] should not leave corrupted or partial objects when node restarts during active write", func() {
+		readyNodes, err := specs.CountReadyNodes(ctx, f.ClientSet)
+		framework.ExpectNoError(err)
+		if readyNodes < 1 {
+			e2eskipper.Skipf("node restart test requires at least 1 ready node, got %d", readyNodes)
+		}
+
+		init(1)
+		defer cleanup()
+
+		ginkgo.By("Creating pod with GCS FUSE volume")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+		tPod.WaitForRunning(ctx)
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo initial > %v/initial", mountPath))
+
+		ginkgo.By("Starting background continuous write; will restart node during I/O")
+		ioDone := make(chan struct{})
+		go func() {
+			defer close(ioDone)
+			_, _, _ = e2epod.ExecCommandInContainerWithFullOutput(f, tPod.GetPodName(), specs.TesterContainerName, "/bin/sh", "-c",
+				fmt.Sprintf("for i in $(seq 1 30); do echo \"RECORD $i\" >> %v/iofile 2>/dev/null; sleep 1; done", mountPath))
+		}()
+
+		time.Sleep(5 * time.Second)
+		ginkgo.By("Draining and restarting the node while write is in progress")
+		specs.DrainNodeAndRestartNode(ctx, f.ClientSet, tPod.GetNode())
+		<-ioDone
+
+		ginkgo.By("Creating new pod with same volume on restarted node")
+		tPod2 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod2.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod2.SetNodeAffinity(tPod.GetNode(), true)
+		tPod2.Create(ctx)
+		defer tPod2.Cleanup(ctx)
+		tPod2.WaitForRunning(ctx)
+
+		ginkgo.By("Verifying mount and that remounted pod can resume reads and writes")
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep initial %v/initial", mountPath))
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo resumed >> %v/post-restart && grep resumed %v/post-restart", mountPath, mountPath))
+
+		ginkgo.By("Verifying no partial/malformed lines in iofile: every line must be complete RECORD N")
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName,
+			fmt.Sprintf("awk '!/^RECORD [0-9]+$/{print \"INVALID:\", $0; exit 1}' %v/iofile", mountPath))
+	})
+
+	// Node restart with hostNetwork=true pods using token sidecar: hostNetwork + KSA opt-in + projected tokens → restart node.
+	// Expected: Token sidecar recreated properly, new OAuth token issued, mount succeeds and pod can read from GCS.
+	// We pre-populate the bucket via the driver so the pod only reads (avoids flaky write from FUSE in hostNetwork+KSA).
+	ginkgo.It("[Disruptive] should recreate token sidecar and mount successfully after node restart when hostNetwork=true with KSA opt-in", func() {
+		readyNodes, err := specs.CountReadyNodes(ctx, f.ClientSet)
+		framework.ExpectNoError(err)
+		if readyNodes < 1 {
+			e2eskipper.Skipf("node restart test requires at least 1 ready node, got %d", readyNodes)
+		}
+
+		gcsDriver, ok := driver.(*specs.GCSFuseCSITestDriver)
+		if !ok {
+			framework.Failf("driver must be GCSFuseCSITestDriver for hostNetwork+KSA node restart test")
+		}
+
+		init(1)
+		defer cleanup()
+
+		bucketName := l.volumeResource.Pv.Spec.CSI.VolumeHandle
+		gomega.Expect(bucketName).NotTo(gomega.BeEmpty(), "volume handle (bucket name) must be set")
+		ginkgo.By("Pre-populating bucket with object 'data' so pod only needs to read")
+		gcsDriver.CreateTestFileInBucket(ctx, "data", bucketName)
+
+		ginkgo.By("Configuring hostNetwork pod with KSA opt-in and projected tokens")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.EnableHostNetwork()
+		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+		tPod.WaitForRunning(ctx)
+
+		ginkgo.By("Verifying mount and that pod can read object from GCS before node restart")
+		tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName, fmt.Sprintf(`mountpoint -d "%s"`, mountPath))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep -q data %v/data", mountPath))
+
+		nodeName := tPod.GetNode()
+		gomega.Expect(nodeName).NotTo(gomega.BeEmpty(), "pod should be scheduled and have node name")
+
+		ginkgo.By("Draining and restarting the node (pod will be evicted)")
+		specs.DrainNodeAndRestartNode(ctx, f.ClientSet, nodeName)
+
+		ginkgo.By("Creating new hostNetwork pod with same volume on restarted node")
+		tPod2 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod2.EnableHostNetwork()
+		tPod2.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
+		tPod2.SetNodeAffinity(nodeName, true)
+		tPod2.Create(ctx)
+		defer tPod2.Cleanup(ctx)
+		tPod2.WaitForRunning(ctx)
+
+		ginkgo.By("Verifying token sidecar recreated: projected SA token volume present")
+		pod2, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, tPod2.GetPodName(), metav1.GetOptions{})
+		framework.ExpectNoError(err)
+		var hasTokenVolume bool
+		for _, vol := range pod2.Spec.Volumes {
+			if vol.Name == webhook.SidecarContainerSATokenVolumeName {
+				hasTokenVolume = true
+				break
+			}
+		}
+		gomega.Expect(hasTokenVolume).To(gomega.BeTrue(),
+			"hostNetwork pod must have volume %q for sidecar token-based auth after restart", webhook.SidecarContainerSATokenVolumeName)
+
+		ginkgo.By("Verifying mount with new sidecar and that sidecar can access GCS bucket and read object")
+		tPod2.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName, fmt.Sprintf(`mountpoint -d "%s"`, mountPath))
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep -q data %v/data", mountPath))
 	})
 }

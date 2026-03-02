@@ -408,7 +408,8 @@ func (t *gcsFuseCSIMetadataPrefetchTestSuite) DefineTests(driver storageframewor
 		tPod1.WaitForRunning(ctx)
 
 		ginkgo.By("Creating many files to exercise metadata prefetch")
-		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("for i in $(seq 1 100); do echo file-$i > %v/file-$i; done", mountPath))
+		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName,
+			fmt.Sprintf("for i in $(seq 1 100); do echo file-$i > %v/file-$i; done", mountPath))
 
 		ginkgo.By("Deleting the first pod")
 		tPod1.Cleanup(ctx)
@@ -424,32 +425,57 @@ func (t *gcsFuseCSIMetadataPrefetchTestSuite) DefineTests(driver storageframewor
 		ginkgo.By("Checking that the second pod is running")
 		tPod2.WaitForRunning(ctx)
 
-		ginkgo.By("Verifying metadata prefetch init container is ready before workload")
-		pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, tPod2.GetPodName(), metav1.GetOptions{})
+		// -----------------------------
+		// Init container readiness check
+		// -----------------------------
+		ginkgo.By("Checking metadata prefetch init container readiness status")
+
+		pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).
+			Get(ctx, tPod2.GetPodName(), metav1.GetOptions{})
 		framework.ExpectNoError(err)
+
 		var prefetchFound bool
+
 		for _, cs := range pod.Status.InitContainerStatuses {
 			if cs.Name == webhook.MetadataPrefetchSidecarName {
 				prefetchFound = true
-				// Native sidecar init containers use RestartPolicy Always and stay Running (never Terminated).
-				// Accept either Terminated with exit 0 or Running as "ready for workload".
+
+				ginkgo.By(fmt.Sprintf("Found metadata prefetch init container: %s", cs.Name))
+
 				if cs.State.Terminated != nil {
 					if cs.State.Terminated.ExitCode != 0 {
-						framework.Failf("metadata prefetch init container exited with code %d, state: %+v", cs.State.Terminated.ExitCode, cs.State)
+						ginkgo.By(fmt.Sprintf("Init container terminated with non-zero exit code: %d",
+							cs.State.Terminated.ExitCode))
+						framework.Failf("metadata prefetch init container exited with code %d, state: %+v",
+							cs.State.Terminated.ExitCode, cs.State)
+					} else {
+						ginkgo.By("Init container terminated successfully with exit code 0")
 					}
-				} else if cs.State.Running == nil {
-					framework.Failf("metadata prefetch init container not ready (expected Running or Terminated), state: %+v", cs.State)
+				} else if cs.State.Running != nil {
+					ginkgo.By("Init container is currently running → considered ready for workload")
+				} else {
+					ginkgo.By(fmt.Sprintf("Init container is NOT ready, state: %+v", cs.State))
+					framework.Failf("metadata prefetch init container not ready (expected Running or Terminated)")
 				}
 				break
 			}
 		}
+
 		if !prefetchFound {
+			ginkgo.By("Metadata prefetch init container NOT found in pod status")
 			framework.Failf("metadata prefetch init container status not found in pod %s", pod.Name)
 		}
 
+		// -----------------------------
+		// Run heavy stat/list workload
+		// -----------------------------
 		ginkgo.By("Running a heavy list/stat workload after metadata prefetch")
-		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("test $(ls %v/file-* | wc -l) -ge 100", mountPath))
-		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("for i in 1 20 40 60 80 100; do stat %v/file-$i >/dev/null; done", mountPath))
+
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName,
+			fmt.Sprintf("test $(ls %v/file-* | wc -l) -ge 100", mountPath))
+
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName,
+			fmt.Sprintf("for i in 1 20 40 60 80 100; do stat %v/file-$i >/dev/null; done", mountPath))
 	})
 
 	ginkgo.It("[metadata prefetch] should list exact file count after metadata prefetch", func() {

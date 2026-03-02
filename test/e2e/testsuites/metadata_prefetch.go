@@ -23,7 +23,12 @@ import (
 	"os"
 	"strconv"
 
+	"local/test/e2e/specs"
+	"local/test/e2e/utils"
+
+	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/webhook"
 	"github.com/onsi/ginkgo/v2"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/test/e2e/framework"
@@ -31,8 +36,6 @@ import (
 	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
 	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
 	admissionapi "k8s.io/pod-security-admission/api"
-	"local/test/e2e/specs"
-	"local/test/e2e/utils"
 )
 
 type gcsFuseCSIMetadataPrefetchTestSuite struct {
@@ -194,6 +197,13 @@ func (t *gcsFuseCSIMetadataPrefetchTestSuite) DefineTests(driver storageframewor
 		}
 	}
 
+	ginkgo.It("[metadata prefetch] should list directory contents correctly after metadata prefetch", func() {
+		if pattern.VolType == storageframework.DynamicPV {
+			e2eskipper.Skipf("skip for volume type %v", storageframework.DynamicPV)
+		}
+		testCaseListDirectoryAfterPrefetch(specs.EnableMetadataPrefetchPrefix)
+	})
+
 	testCaseFileMetadataAfterPrefetch := func(configPrefix string) {
 		init(configPrefix)
 		defer cleanup()
@@ -236,6 +246,12 @@ func (t *gcsFuseCSIMetadataPrefetchTestSuite) DefineTests(driver storageframewor
 			tPod2.VerifyMetadataPrefetchNotPresent()
 		}
 	}
+	ginkgo.It("[metadata prefetch] should expose correct file metadata (stat) after metadata prefetch", func() {
+		if pattern.VolType == storageframework.DynamicPV {
+			e2eskipper.Skipf("skip for volume type %v", storageframework.DynamicPV)
+		}
+		testCaseFileMetadataAfterPrefetch(specs.EnableMetadataPrefetchPrefix)
+	})
 
 	testCaseNestedDirectoryAfterPrefetch := func(configPrefix string) {
 		init(configPrefix)
@@ -281,25 +297,208 @@ func (t *gcsFuseCSIMetadataPrefetchTestSuite) DefineTests(driver storageframewor
 		}
 	}
 
-	ginkgo.It("[metadata prefetch] should list directory contents correctly after metadata prefetch", func() {
-		if pattern.VolType == storageframework.DynamicPV {
-			e2eskipper.Skipf("skip for volume type %v", storageframework.DynamicPV)
-		}
-		testCaseListDirectoryAfterPrefetch(specs.EnableMetadataPrefetchPrefix)
-	})
-
-	ginkgo.It("[metadata prefetch] should expose correct file metadata (stat) after metadata prefetch", func() {
-		if pattern.VolType == storageframework.DynamicPV {
-			e2eskipper.Skipf("skip for volume type %v", storageframework.DynamicPV)
-		}
-		testCaseFileMetadataAfterPrefetch(specs.EnableMetadataPrefetchPrefix)
-	})
-
 	ginkgo.It("[metadata prefetch] should retain nested directory structure after pod restart", func() {
 		if pattern.VolType == storageframework.DynamicPV {
 			e2eskipper.Skipf("skip for volume type %v", storageframework.DynamicPV)
 		}
 		testCaseNestedDirectoryAfterPrefetch(specs.EnableMetadataPrefetchPrefix)
+	})
+
+	testCaseManyFilesAfterPrefetch := func(configPrefix string) {
+		init(configPrefix)
+		defer cleanup()
+
+		ginkgo.By("Configuring the first pod with many files")
+		tPod1 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod1.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+
+		ginkgo.By("Deploying the first pod")
+		tPod1.Create(ctx)
+
+		ginkgo.By("Checking that the first pod is running")
+		tPod1.WaitForRunning(ctx)
+
+		ginkgo.By("Creating many files in a single directory")
+		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("for i in $(seq 1 50); do echo file-$i > %v/file-$i; done", mountPath))
+
+		ginkgo.By("Verifying exact files exist before prefetch")
+		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("test $(ls %v/file-* | wc -l) -eq 50", mountPath))
+		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("for i in $(seq 1 50); do test -f %v/file-$i || exit 1; done", mountPath))
+
+		ginkgo.By("Deleting the first pod")
+		tPod1.Cleanup(ctx)
+
+		ginkgo.By("Configuring the second pod")
+		tPod2 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod2.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+
+		ginkgo.By("Deploying the second pod")
+		tPod2.Create(ctx)
+		defer tPod2.Cleanup(ctx)
+
+		ginkgo.By("Checking that the second pod is running")
+		tPod2.WaitForRunning(ctx)
+
+		ginkgo.By("Verifying exact file count and that all expected files are present after prefetch")
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("test $(ls %v/file-* | wc -l) -eq 50", mountPath))
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("for i in $(seq 1 50); do test -f %v/file-$i || exit 1; done", mountPath))
+
+		ginkgo.By("Verifying we can stat all 50 files after prefetch")
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("for i in $(seq 1 50); do stat %v/file-$i >/dev/null || exit 1; done", mountPath))
+
+		if supportsNativeSidecar {
+			ginkgo.By("Checking metadata prefetch sidecar present on the second pod")
+			tPod2.VerifyMetadataPrefetchPresence()
+		} else {
+			ginkgo.By("Checking metadata prefetch sidecar not present on the second pod")
+			tPod2.VerifyMetadataPrefetchNotPresent()
+		}
+	}
+
+	ginkgo.It("[metadata prefetch] should handle many files in a single directory after metadata prefetch", func() {
+		if pattern.VolType == storageframework.DynamicPV {
+			e2eskipper.Skipf("skip for volume type %v", storageframework.DynamicPV)
+		}
+		testCaseManyFilesAfterPrefetch(specs.EnableMetadataPrefetchPrefix)
+	})
+
+	ginkgo.It("[metadata prefetch] should not inject metadata prefetch sidecar when feature is disabled", func() {
+		if pattern.VolType == storageframework.DynamicPV {
+			e2eskipper.Skipf("skip for volume type %v", storageframework.DynamicPV)
+		}
+
+		init()
+		defer cleanup()
+
+		ginkgo.By("Configuring a pod without metadata prefetch enabled")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+
+		ginkgo.By("Deploying the pod")
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+
+		ginkgo.By("Checking that the pod is running")
+		tPod.WaitForRunning(ctx)
+
+		ginkgo.By("Verifying metadata prefetch sidecar is not present when feature is disabled")
+		tPod.VerifyMetadataPrefetchNotPresent()
+	})
+
+	ginkgo.It("[metadata prefetch] metadata prefetch init container should complete before heavy list/stat workload", func() {
+		if pattern.VolType == storageframework.DynamicPV {
+			e2eskipper.Skipf("skip for volume type %v", storageframework.DynamicPV)
+		}
+
+		if !supportsNativeSidecar {
+			e2eskipper.Skipf("metadata prefetch init container is only used with native sidecar")
+		}
+
+		init(specs.EnableMetadataPrefetchPrefix)
+		defer cleanup()
+
+		ginkgo.By("Configuring the first pod to create many files")
+		tPod1 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod1.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+
+		ginkgo.By("Deploying the first pod")
+		tPod1.Create(ctx)
+
+		ginkgo.By("Checking that the first pod is running")
+		tPod1.WaitForRunning(ctx)
+
+		ginkgo.By("Creating many files to exercise metadata prefetch")
+		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("for i in $(seq 1 100); do echo file-$i > %v/file-$i; done", mountPath))
+
+		ginkgo.By("Deleting the first pod")
+		tPod1.Cleanup(ctx)
+
+		ginkgo.By("Configuring the second pod")
+		tPod2 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod2.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+
+		ginkgo.By("Deploying the second pod")
+		tPod2.Create(ctx)
+		defer tPod2.Cleanup(ctx)
+
+		ginkgo.By("Checking that the second pod is running")
+		tPod2.WaitForRunning(ctx)
+
+		ginkgo.By("Verifying metadata prefetch init container is ready before workload")
+		pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, tPod2.GetPodName(), metav1.GetOptions{})
+		framework.ExpectNoError(err)
+		var prefetchFound bool
+		for _, cs := range pod.Status.InitContainerStatuses {
+			if cs.Name == webhook.MetadataPrefetchSidecarName {
+				prefetchFound = true
+				// Native sidecar init containers use RestartPolicy Always and stay Running (never Terminated).
+				// Accept either Terminated with exit 0 or Running as "ready for workload".
+				if cs.State.Terminated != nil {
+					if cs.State.Terminated.ExitCode != 0 {
+						framework.Failf("metadata prefetch init container exited with code %d, state: %+v", cs.State.Terminated.ExitCode, cs.State)
+					}
+				} else if cs.State.Running == nil {
+					framework.Failf("metadata prefetch init container not ready (expected Running or Terminated), state: %+v", cs.State)
+				}
+				break
+			}
+		}
+		if !prefetchFound {
+			framework.Failf("metadata prefetch init container status not found in pod %s", pod.Name)
+		}
+
+		ginkgo.By("Running a heavy list/stat workload after metadata prefetch")
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("test $(ls %v/file-* | wc -l) -ge 100", mountPath))
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("for i in 1 20 40 60 80 100; do stat %v/file-$i >/dev/null; done", mountPath))
+	})
+
+	ginkgo.It("[metadata prefetch] should list exact file count after metadata prefetch", func() {
+		if pattern.VolType == storageframework.DynamicPV {
+			e2eskipper.Skipf("skip for volume type %v", storageframework.DynamicPV)
+		}
+
+		init(specs.EnableMetadataPrefetchPrefix)
+		defer cleanup()
+
+		const fileCount = 25
+
+		ginkgo.By("Configuring the first pod")
+		tPod1 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod1.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+
+		ginkgo.By("Deploying the first pod")
+		tPod1.Create(ctx)
+
+		ginkgo.By("Checking that the first pod is running")
+		tPod1.WaitForRunning(ctx)
+
+		ginkgo.By("Creating exactly N files in a dedicated directory")
+		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mkdir -p %v/count-test", mountPath))
+		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("for i in $(seq 1 %d); do echo $i > %v/count-test/f-$i; done", fileCount, mountPath))
+		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("test $(ls %v/count-test/ | wc -l) -eq %d", mountPath, fileCount))
+
+		ginkgo.By("Deleting the first pod")
+		tPod1.Cleanup(ctx)
+
+		ginkgo.By("Configuring the second pod with metadata prefetch")
+		tPod2 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod2.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+
+		ginkgo.By("Deploying the second pod")
+		tPod2.Create(ctx)
+		defer tPod2.Cleanup(ctx)
+
+		ginkgo.By("Checking that the second pod is running")
+		tPod2.WaitForRunning(ctx)
+
+		ginkgo.By("Verifying list after prefetch returns exact file count")
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("test $(ls %v/count-test/ | wc -l) -eq %d", mountPath, fileCount))
+
+		if supportsNativeSidecar {
+			tPod2.VerifyMetadataPrefetchPresence()
+		} else {
+			tPod2.VerifyMetadataPrefetchNotPresent()
+		}
 	})
 
 	testCaseThirdPodSeesDataFromTwoPods := func(configPrefix string) {

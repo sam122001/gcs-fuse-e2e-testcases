@@ -291,9 +291,13 @@ func (t *gcsFuseCSINodeDriverRestartTestSuite) DefineTests(driver storageframewo
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo ok > %v/data && grep ok %v/data", mountPath, mountPath))
 	})
 
-	// Node driver restarts while metadata prefetch is in use: after restart, metadata should be
-	// rebuilt correctly and not return stale results.
-	ginkgo.It("[metadata prefetch] should rebuild metadata correctly after node driver restart and not return stale results", func() {
+	// Node driver restarts while metadata prefetch is in use. In native sidecar mode the node
+	// driver restart must NOT disrupt the sidecar-mounted gcsfuse instance:
+	//   - gcsfuse continues running (mount stays present and rw)
+	//   - metadata cache stays untouched (no extra rebuild triggered by the restart)
+	//   - directory state remains consistent and data is not corrupted.
+	// This test checks "no disruption + no stale metadata + no corruption".
+	ginkgo.It("[metadata prefetch] should keep metadata cache and directory state consistent across node driver restart without stale results or corruption", func() {
 		if !supportsNativeSidecar {
 			e2eskipper.Skipf("metadata prefetch requires native sidecar")
 		}
@@ -308,14 +312,15 @@ func (t *gcsFuseCSINodeDriverRestartTestSuite) DefineTests(driver storageframewo
 
 		tPod.WaitForRunning(ctx)
 
-		ginkgo.By("Writing file and triggering metadata (ls, stat)")
+		ginkgo.By("Writing file and priming metadata cache (ls, stat)")
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo before-restart > %v/prefetch-test", mountPath))
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("ls -la %v && stat %v/prefetch-test", mountPath, mountPath))
 
 		ginkgo.By("Restarting CSI node driver on the node")
 		specs.RestartNodeDriverOnNode(ctx, f.ClientSet, tPod.GetNode())
 
-		ginkgo.By("Verifying metadata is correct after restart (no stale results)")
+		ginkgo.By("Verifying mount and metadata are unchanged after restart (no disruption, no stale results, no corruption)")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep before-restart %v/prefetch-test", mountPath))
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("ls -la %v | grep prefetch-test", mountPath))
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo after-restart >> %v/prefetch-test && grep after-restart %v/prefetch-test", mountPath, mountPath))
@@ -323,7 +328,7 @@ func (t *gcsFuseCSINodeDriverRestartTestSuite) DefineTests(driver storageframewo
 
 	// Node driver restarts under resource pressure: run moderate CPU load on the same node,
 	// restart the node driver, then verify the workload pod still has a valid mount and can do I/O.
-	ginkgo.It("[Disruptive] should recover when node driver restarts under moderate CPU load on the node", func() {
+	ginkgo.It("[Disruptive] should Mount remains stable when CSI Node restarts under high CPU load on the node", func() {
 		init(1)
 		defer cleanup()
 

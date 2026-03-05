@@ -231,10 +231,6 @@ func (t *TestPod) GetPodVols() []corev1.Volume {
 	return t.pod.Spec.Volumes
 }
 
-func (t *TestPod) GetAutoMountServiceAccountToken() bool {
-	return *t.pod.Spec.AutomountServiceAccountToken
-}
-
 // VerifyExecInPodSucceed verifies shell cmd in target pod succeed.
 func (t *TestPod) VerifyExecInPodSucceed(f *framework.Framework, containerName, shExec string) {
 	_ = t.VerifyExecInPodSucceedWithOutput(f, containerName, shExec)
@@ -1353,6 +1349,33 @@ func getDriverNamespace() string {
 		return driverNamespaceOSS
 	}
 	return driverNamespaceManaged
+}
+
+// NewStressPod returns a TestPod that runs a CPU stress workload on the given node.
+// Used by hostNetwork and node driver restart tests to apply load during CSI restart.
+func NewStressPod(c clientset.Interface, ns *corev1.Namespace, nodeName string) *TestPod {
+	stressPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "hostnetwork-stress-",
+			Namespace:    ns.Name,
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			NodeName:     nodeName,
+			Containers: []corev1.Container{
+				{
+					Name:    "stress",
+					Image:   UbuntuImage,
+					Command: []string{"/bin/bash", "-c", "for i in $(seq 1 90); do dd if=/dev/zero of=/dev/null bs=1M count=50 2>/dev/null; sleep 1; done"},
+				},
+			},
+		},
+	}
+	return &TestPod{
+		client:    c,
+		namespace: ns,
+		pod:       stressPod,
+	}
 }
 
 // RestartNodeDriverOnNode deletes the CSI node driver pod on the given node and waits for a new one to be Running and Ready.

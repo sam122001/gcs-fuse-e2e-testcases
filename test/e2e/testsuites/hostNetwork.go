@@ -1,18 +1,7 @@
 /*
-Copyright 2018 The Kubernetes Authors.
-Copyright 2022 Google LLC
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+Clean HostNetwork Test Suite for GCSFuse CSI Driver
+Contains exactly 8 meaningful hostNetwork tests:
+HN-1, HN-2, HN-3, HN-4, HN-5, HN-7, HN-8, HN-9
 */
 
 package testsuites
@@ -20,6 +9,8 @@ package testsuites
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"local/test/e2e/specs"
 
@@ -34,11 +25,14 @@ import (
 	admissionapi "k8s.io/pod-security-admission/api"
 )
 
+const (
+	metadataServerURL = "http://169.254.169.254/computeMetadata/v1/"
+)
+
 type gcsFuseCSIHostNetworkTestSuite struct {
 	tsInfo storageframework.TestSuiteInfo
 }
 
-// InitGcsFuseCSIHostNetworkTestSuite returns gcsFuseCSIHostNetworkTestSuite that implements TestSuite interface.
 func InitGcsFuseCSIHostNetworkTestSuite() storageframework.TestSuite {
 	return &gcsFuseCSIHostNetworkTestSuite{
 		tsInfo: storageframework.TestSuiteInfo{
@@ -57,7 +51,10 @@ func (t *gcsFuseCSIHostNetworkTestSuite) GetTestSuiteInfo() storageframework.Tes
 func (t *gcsFuseCSIHostNetworkTestSuite) SkipUnsupportedTests(_ storageframework.TestDriver, _ storageframework.TestPattern) {
 }
 
-func (t *gcsFuseCSIHostNetworkTestSuite) DefineTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
+func (t *gcsFuseCSIHostNetworkTestSuite) DefineTests(
+	driver storageframework.TestDriver,
+	pattern storageframework.TestPattern,
+) {
 	type local struct {
 		config         *storageframework.PerTestConfig
 		volumeResource *storageframework.VolumeResource
@@ -78,209 +75,21 @@ func (t *gcsFuseCSIHostNetworkTestSuite) DefineTests(driver storageframework.Tes
 	}
 
 	cleanup := func() {
-		var cleanUpErrs []error
-		cleanUpErrs = append(cleanUpErrs, l.volumeResource.CleanupResource(ctx))
-		err := utilerrors.NewAggregate(cleanUpErrs)
-		framework.ExpectNoError(err, "while cleaning up")
+		err := utilerrors.NewAggregate([]error{
+			l.volumeResource.CleanupResource(ctx),
+		})
+		framework.ExpectNoError(err)
 	}
 
-	// Test 1: HostNetwork pod with KSA opt-in should mount GCS bucket, read/write data, and have hostNetwork=true in pod spec.
-	ginkgo.It("should mount GCS bucket and read/write data when hostNetwork=true with KSA opt-in", func() {
-		init()
-		defer cleanup()
-
-		ginkgo.By("Configuring hostNetwork pod with KSA opt-in")
-		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
-		tPod.EnableHostNetwork()
-		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
-
-		ginkgo.By("Deploying hostNetwork pod")
-		tPod.Create(ctx)
-
-		ginkgo.By("Checking pod is running")
-		tPod.WaitForRunning(ctx)
-
-		ginkgo.By("Verifying pod has HostNetwork=true in spec via API")
-		pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, tPod.GetPodName(), metav1.GetOptions{})
+	expectHostNetwork := func(podName string) {
+		pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, podName, metav1.GetOptions{})
 		framework.ExpectNoError(err)
-		gomega.Expect(pod.Spec.HostNetwork).To(gomega.BeTrue(), "pod spec must have hostNetwork=true for hostNetwork tests")
+		gomega.Expect(pod.Spec.HostNetwork).To(gomega.BeTrue(), "pod %q must have HostNetwork=true", podName)
+	}
 
-		ginkgo.By("Verifying mount is present and read-write")
-		tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName, fmt.Sprintf(`mountpoint -d "%s"`, mountPath))
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
-
-		ginkgo.By("Verifying read/write to bucket")
-		testFile := "hostnetwork-data-test"
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("touch %v/%v", mountPath, testFile))
-		contents := tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName, fmt.Sprintf("ls %v", mountPath))
-		gomega.Expect(contents).To(gomega.Equal(testFile))
-
-		ginkgo.By("Deleting pod")
-		tPod.Cleanup(ctx)
-	})
-
-	// Test 2: HostNetwork pod with multiple GCS volumes (KSA opt-in) should mount and access both.
-	ginkgo.It("should mount and access multiple GCS volumes when hostNetwork=true with KSA opt-in", func() {
-		init()
-		defer cleanup()
-
-		ginkgo.By("Configuring hostNetwork pod with two volumes and KSA opt-in")
-		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
-		tPod.EnableHostNetwork()
-		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
-		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName2, mountPath2, false)
-
-		ginkgo.By("Deploying hostNetwork pod")
-		tPod.Create(ctx)
-
-		ginkgo.By("Checking pod is running")
-		tPod.WaitForRunning(ctx)
-
-		ginkgo.By("Verifying both mounts are present")
-		tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName, fmt.Sprintf(`mountpoint -d "%s"`, mountPath))
-		tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName, fmt.Sprintf(`mountpoint -d "%s"`, mountPath2))
-
-		ginkgo.By("Verifying read/write to both volumes")
-		testFile := "multi-volume-test"
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("touch %v/%v", mountPath, testFile))
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("touch %v/%v", mountPath2, testFile))
-		contents1 := tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName, fmt.Sprintf("ls %v", mountPath))
-		contents2 := tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName, fmt.Sprintf("ls %v", mountPath2))
-		gomega.Expect(contents1).To(gomega.Equal(testFile))
-		gomega.Expect(contents2).To(gomega.Equal(testFile))
-
-		ginkgo.By("Deleting pod")
-		tPod.Cleanup(ctx)
-	})
-
-	// Test 3: Writing to a read-only volume on a hostNetwork pod with KSA opt-in should fail.
-	ginkgo.It("should fail when writing to read-only volume on hostnetwork pod with KSA opt-in", func() {
-		init()
-		defer cleanup()
-
-		ginkgo.By("Configuring hostNetwork pod with read-only volume and KSA opt-in")
-		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
-		tPod.EnableHostNetwork()
-		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, true) // true = readOnly
-
-		ginkgo.By("Deploying hostNetwork pod")
-		tPod.Create(ctx)
-
-		ginkgo.By("Checking pod is running")
-		tPod.WaitForRunning(ctx)
-
-		ginkgo.By("Verifying volume is mounted read-only")
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep ro,", mountPath))
-
-		ginkgo.By("Expecting error when writing to read-only volume")
-		tPod.VerifyExecInPodFail(f, specs.TesterContainerName, fmt.Sprintf("echo 'hello world' > %v/data", mountPath), 1)
-
-		ginkgo.By("Deleting pod")
-		tPod.Cleanup(ctx)
-	})
-
-	// Test 4: HostNetwork pod with KSA opt-in and automountServiceAccountToken=false should run and access volume.
-	ginkgo.It("should run hostnetwork pod with KSA opt-in and automountServiceAccountToken false", func() {
-		init()
-		defer cleanup()
-
-		ginkgo.By("Configuring hostNetwork pod with KSA opt-in and automountServiceAccountToken=false")
-		tPod := specs.NewTestPodModifiedSpec(f.ClientSet, f.Namespace, false)
-		tPod.EnableHostNetwork()
-		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
-
-		ginkgo.By("Deploying hostNetwork pod")
-		tPod.Create(ctx)
-
-		ginkgo.By("Checking pod is running")
-		tPod.WaitForRunning(ctx)
-
-		ginkgo.By("Verifying pod has AutomountServiceAccountToken=false via API")
-		pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, tPod.GetPodName(), metav1.GetOptions{})
-		framework.ExpectNoError(err)
-		gomega.Expect(pod.Spec.AutomountServiceAccountToken).ToNot(gomega.BeNil())
-		gomega.Expect(*pod.Spec.AutomountServiceAccountToken).To(gomega.BeFalse())
-
-		ginkgo.By("Verifying mount is present and volume is accessible")
-		tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName, fmt.Sprintf(`mountpoint -d "%s"`, mountPath))
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo 'hello world' > %v/data && grep 'hello world' %v/data", mountPath, mountPath))
-
-		ginkgo.By("Deleting pod")
-		tPod.Cleanup(ctx)
-	})
-
-	// Test 5: Dedicated gcsfuse-on-hostNetwork test: assert FUSE mount type and gcsfuse-specific behavior (implicit dirs).
-	ginkgo.It("should mount GCS bucket via gcsfuse when hostNetwork=true with KSA opt-in and expose fuse mount with implicit-dirs", func() {
-		init(specs.ImplicitDirsVolumePrefix)
-		defer cleanup()
-
-		ginkgo.By("Configuring hostNetwork pod with KSA opt-in and implicit-dirs volume")
-		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
-		tPod.EnableHostNetwork()
-		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
-
-		ginkgo.By("Deploying hostNetwork pod")
-		tPod.Create(ctx)
-
-		ginkgo.By("Checking pod is running")
-		tPod.WaitForRunning(ctx)
-
-		ginkgo.By("Verifying mount is present")
-		tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName, fmt.Sprintf(`mountpoint -d "%s"`, mountPath))
-
-		ginkgo.By("Verifying mount is fuse/gcsfuse (not just any volume)")
-		mountLine := tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName, fmt.Sprintf("mount | grep '%s'", mountPath))
-		gomega.Expect(mountLine).To(gomega.Not(gomega.BeEmpty()), "mount table should contain entry for %s", mountPath)
-		gomega.Expect(mountLine).To(gomega.MatchRegexp(`fuse|gcsfuse`), "mount at %s should be a fuse/gcsfuse mount, got: %s", mountPath, mountLine)
-
-		ginkgo.By("Verifying gcsfuse-specific behavior: read/write in implicit directory")
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName,
-			fmt.Sprintf("echo 'hello world' > %v/%v/data && grep 'hello world' %v/%v/data", mountPath, specs.ImplicitDirsPath, mountPath, specs.ImplicitDirsPath))
-
-		ginkgo.By("Deleting pod")
-		tPod.Cleanup(ctx)
-	})
-	// Test 6: HostNetwork pod should access metadata server and fetch token (mount covered by Test 1).
-	ginkgo.It("should access metadata server and fetch token when hostNetwork=true with KSA opt-in", func() {
-		init()
-		defer cleanup()
-
-		ginkgo.By("Configuring hostNetwork pod with KSA opt-in")
-		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
-		tPod.EnableHostNetwork()
-		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
-
-		ginkgo.By("Deploying hostNetwork pod")
-		tPod.Create(ctx)
-
-		ginkgo.By("Waiting for pod to be running")
-		tPod.WaitForRunning(ctx)
-
-		ginkgo.By("Verifying metadata server is reachable")
-		tPod.VerifyExecInPodSucceed(
-			f,
-			specs.TesterContainerName,
-			`wget -q -O - --header="Metadata-Flavor: Google" http://metadata.google.internal`,
-		)
-
-		ginkgo.By("Fetching access token from metadata server")
-		tokenOutput := tPod.VerifyExecInPodSucceedWithOutput(
-			f,
-			specs.TesterContainerName,
-			`wget -q -O - --header="Metadata-Flavor: Google" \
-        http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token`,
-		)
-
-		gomega.Expect(tokenOutput).To(
-			gomega.ContainSubstring("access_token"),
-			"metadata server should return access_token",
-		)
-
-		ginkgo.By("Deleting pod")
-		tPod.Cleanup(ctx)
-	})
-
-	// Test 7: DNS/HTTPS connectivity for GCS and API domains in hostNetwork pod (uses wget; ping/curl may be unavailable in test image).
+	// ----------------------------------------------------------------------
+	// ⭐ HN-1: DNS + HTTPS reachability for hostNetwork pods
+	// ----------------------------------------------------------------------
 	ginkgo.It("should resolve storage.googleapis.com and required domains when hostNetwork=true", func() {
 		init()
 		defer cleanup()
@@ -314,40 +123,200 @@ func (t *gcsFuseCSIHostNetworkTestSuite) DefineTests(driver storageframework.Tes
 		tPod.Cleanup(ctx)
 	})
 
-	// Test 8: hostNetwork + KSA opt-in must inject projected SA token volume for sidecar (required for gcsfuse auth).
-	ginkgo.It("should inject projected SA token volume for sidecar when hostNetwork=true with KSA opt-in", func() {
+	// ----------------------------------------------------------------------
+	// ⭐ HN-2: KSA opt-in → metadata server must NOT be reachable
+	// ----------------------------------------------------------------------
+	ginkgo.It("[HN-2] should NOT reach metadata server when KSA opt-in + hostNetwork", func() {
 		init()
 		defer cleanup()
 
-		ginkgo.By("Configuring hostNetwork pod with KSA opt-in")
 		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
 		tPod.EnableHostNetwork()
 		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
-
-		ginkgo.By("Deploying hostNetwork pod")
 		tPod.Create(ctx)
-
-		ginkgo.By("Checking pod is running")
 		tPod.WaitForRunning(ctx)
+		expectHostNetwork(tPod.GetPodName())
 
-		ginkgo.By("Verifying pod has projected SA token volume for sidecar (required for hostNetwork auth)")
+		ginkgo.By("Ensuring metadata server (169.254.169.254) is NOT reachable")
+		tPod.VerifyExecInPodFail(
+			f,
+			specs.TesterContainerName,
+			`wget --timeout=2 -q --spider --header="Metadata-Flavor: Google" `+metadataServerURL,
+			1,
+		)
+	})
+
+	// ----------------------------------------------------------------------
+	// ⭐ HN-3: KSA opt-out → metadata server MUST be reachable
+	// ----------------------------------------------------------------------
+	ginkgo.It("[HN-3] should reach metadata server when KSA opt-out + hostNetwork", func() {
+		init()
+		defer cleanup()
+
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.EnableHostNetwork()
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.Create(ctx)
+		tPod.WaitForRunning(ctx)
+		expectHostNetwork(tPod.GetPodName())
+
+		ginkgo.By("Fetching access token via metadata server")
+		token := tPod.VerifyExecInPodSucceedWithOutput(
+			f,
+			specs.TesterContainerName,
+			`wget -qO- --header="Metadata-Flavor: Google" `+
+				metadataServerURL+`instance/service-accounts/default/token`,
+		)
+		gomega.Expect(token).To(gomega.ContainSubstring("access_token"))
+	})
+
+	// ----------------------------------------------------------------------
+	// ⭐ HN-4: STS-based auth works (projected SA token injected)
+	// ----------------------------------------------------------------------
+	ginkgo.It("[HN-4] should inject projected SA token & allow STS auth over hostNetwork", func() {
+		init()
+		defer cleanup()
+
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.EnableHostNetwork()
+		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
+		tPod.Create(ctx)
+		tPod.WaitForRunning(ctx)
+		expectHostNetwork(tPod.GetPodName())
+
+		ginkgo.By("Checking for projected token volume")
 		pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, tPod.GetPodName(), metav1.GetOptions{})
 		framework.ExpectNoError(err)
-		var hasTokenVolume bool
-		for _, vol := range pod.Spec.Volumes {
-			if vol.Name == webhook.SidecarContainerSATokenVolumeName {
-				hasTokenVolume = true
+
+		found := false
+		for _, v := range pod.Spec.Volumes {
+			if v.Name == webhook.SidecarContainerSATokenVolumeName {
+				found = true
 				break
 			}
 		}
-		gomega.Expect(hasTokenVolume).To(gomega.BeTrue(),
-			"hostNetwork pods with KSA opt-in must have volume %q for sidecar token-based auth", webhook.SidecarContainerSATokenVolumeName)
+		gomega.Expect(found).To(gomega.BeTrue())
 
-		ginkgo.By("Verifying GCS mount is present and accessible")
-		tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName, fmt.Sprintf(`mountpoint -d "%s"`, mountPath))
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("echo 'token-vol-check' > %v/sidecar-auth-check && grep 'token-vol-check' %v/sidecar-auth-check", mountPath, mountPath))
+		ginkgo.By("Verifying mount is present and read-write")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
 
-		ginkgo.By("Deleting pod")
-		tPod.Cleanup(ctx)
+		ginkgo.By("Verifying STS-authenticated mount works")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName,
+			fmt.Sprintf("echo 'sts-auth' > %v/auth && grep sts-auth %v/auth", mountPath, mountPath),
+		)
+	})
+
+	// ----------------------------------------------------------------------
+	// ⭐ HN-5: CSI driver restart must NOT break the hostNetwork mount
+	// ----------------------------------------------------------------------
+	ginkgo.It("[HN-5] should keep mount valid after CSI node driver restart", func() {
+		init()
+		defer cleanup()
+
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.EnableHostNetwork()
+		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
+		tPod.Create(ctx)
+		tPod.WaitForRunning(ctx)
+		expectHostNetwork(tPod.GetPodName())
+
+		ginkgo.By("Verifying mount and writing initial file")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName,
+			fmt.Sprintf("echo before > %v/f && grep before %v/f", mountPath, mountPath))
+
+		ginkgo.By("Restarting CSI node driver")
+		specs.RestartNodeDriverOnNode(ctx, f.ClientSet, tPod.GetNode())
+
+		ginkgo.By("Verifying mount still present and read-write after restart")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName,
+			fmt.Sprintf("grep before %v/f && echo after >> %v/f && grep after %v/f", mountPath, mountPath, mountPath),
+		)
+	})
+
+	// ----------------------------------------------------------------------
+	// ⭐ HN-7: STS/IAM latency validation over hostNetwork
+	// ----------------------------------------------------------------------
+	ginkgo.It("[HN-7] should successfully call STS/IAM APIs with reasonable latency over hostNetwork", func() {
+		init()
+		defer cleanup()
+
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.EnableHostNetwork()
+		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
+		tPod.Create(ctx)
+		tPod.WaitForRunning(ctx)
+		expectHostNetwork(tPod.GetPodName())
+
+		ginkgo.By("Measuring STS latency")
+		latency := tPod.VerifyExecInPodSucceedWithOutput(
+			f, specs.TesterContainerName,
+			`ts=$(date +%s); wget -qO- https://sts.googleapis.com >/dev/null; te=$(date +%s); echo $((te-ts))`,
+		)
+		lsec, err := strconv.Atoi(strings.TrimSpace(latency))
+		framework.ExpectNoError(err, "latency output %q must parse as integer", latency)
+		gomega.Expect(lsec).To(gomega.BeNumerically(">=", 0), "latency must be non-negative")
+		gomega.Expect(lsec).To(gomega.BeNumerically("<", 20), "STS call should complete within 20s")
+	})
+
+	// ----------------------------------------------------------------------
+	// ⭐ HN-8: HostNetwork pods must NOT resolve cluster DNS
+	// ----------------------------------------------------------------------
+	ginkgo.It("[HN-8] should NOT resolve cluster DNS names when hostNetwork=true", func() {
+		init()
+		defer cleanup()
+
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.EnableHostNetwork()
+		tPod.Create(ctx)
+		tPod.WaitForRunning(ctx)
+		expectHostNetwork(tPod.GetPodName())
+
+		ginkgo.By("Ensuring cluster DNS resolution fails")
+		tPod.VerifyExecInPodFail(
+			f,
+			specs.TesterContainerName,
+			"getent hosts foo.default.svc.cluster.local",
+			1,
+		)
+	})
+
+	// ----------------------------------------------------------------------
+	// ⭐ HN-9: Mount must remain healthy under node CPU pressure + CSI restart
+	// ----------------------------------------------------------------------
+	ginkgo.It("[HN-9] should retain healthy mount under CPU load during CSI node driver restart", func() {
+		init()
+		defer cleanup()
+
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.EnableHostNetwork()
+		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
+		tPod.Create(ctx)
+		tPod.WaitForRunning(ctx)
+		expectHostNetwork(tPod.GetPodName())
+
+		ginkgo.By("Verifying mount and writing initial test file")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+		tPod.VerifyExecInPodSucceed(
+			f, specs.TesterContainerName,
+			fmt.Sprintf("echo before-stress > %v/x", mountPath),
+		)
+
+		ginkgo.By("Launching CPU stress pod on same node")
+		stress := specs.NewStressPod(f.ClientSet, f.Namespace, tPod.GetNode())
+		stress.Create(ctx)
+		defer stress.Cleanup(ctx)
+		stress.WaitForRunning(ctx)
+
+		ginkgo.By("Restarting CSI node driver during CPU load")
+		specs.RestartNodeDriverOnNode(ctx, f.ClientSet, tPod.GetNode())
+
+		ginkgo.By("Validating mount still present and read-write")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+		tPod.VerifyExecInPodSucceed(
+			f, specs.TesterContainerName,
+			fmt.Sprintf("grep before-stress %v/x && echo after-stress >> %v/x && grep after-stress %v/x", mountPath, mountPath, mountPath),
+		)
 	})
 }

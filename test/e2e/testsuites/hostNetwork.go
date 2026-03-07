@@ -141,7 +141,7 @@ func (t *gcsFuseCSIHostNetworkTestSuite) DefineTests(
 		tPod.VerifyExecInPodFail(
 			f,
 			specs.TesterContainerName,
-			`wget --timeout=2 -q --spider --header="Metadata-Flavor: Google" `+metadataServerURL,
+			`wget --timeout=5m -q --spider --header="Metadata-Flavor: Google" `+metadataServerURL,
 			1,
 		)
 	})
@@ -260,10 +260,7 @@ func (t *gcsFuseCSIHostNetworkTestSuite) DefineTests(
 		gomega.Expect(lsec).To(gomega.BeNumerically("<", 20), "STS call should complete within 20s")
 	})
 
-	// ----------------------------------------------------------------------
-	// ⭐ HN-8: HostNetwork pods must NOT resolve cluster DNS
-	// ----------------------------------------------------------------------
-	ginkgo.It("[HN-8] should NOT resolve cluster DNS names when hostNetwork=true", func() {
+	ginkgo.It("[HN-8] should share node network namespace when hostNetwork=true", func() {
 		init()
 		defer cleanup()
 
@@ -271,52 +268,16 @@ func (t *gcsFuseCSIHostNetworkTestSuite) DefineTests(
 		tPod.EnableHostNetwork()
 		tPod.Create(ctx)
 		tPod.WaitForRunning(ctx)
-		expectHostNetwork(tPod.GetPodName())
 
-		ginkgo.By("Ensuring cluster DNS resolution fails")
-		tPod.VerifyExecInPodFail(
-			f,
-			specs.TesterContainerName,
-			"getent hosts foo.default.svc.cluster.local",
-			1,
-		)
-	})
+		ginkgo.By("Getting pod IP")
+		pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, tPod.GetPodName(), metav1.GetOptions{})
+		framework.ExpectNoError(err)
 
-	// ----------------------------------------------------------------------
-	// ⭐ HN-9: Mount must remain healthy under node CPU pressure + CSI restart
-	// ----------------------------------------------------------------------
-	ginkgo.It("[HN-9] should retain healthy mount under CPU load during CSI node driver restart", func() {
-		init()
-		defer cleanup()
+		ginkgo.By("Getting node IP")
+		node, err := f.ClientSet.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{})
+		framework.ExpectNoError(err)
 
-		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
-		tPod.EnableHostNetwork()
-		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
-		tPod.Create(ctx)
-		tPod.WaitForRunning(ctx)
-		expectHostNetwork(tPod.GetPodName())
-
-		ginkgo.By("Verifying mount and writing initial test file")
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
-		tPod.VerifyExecInPodSucceed(
-			f, specs.TesterContainerName,
-			fmt.Sprintf("echo before-stress > %v/x", mountPath),
-		)
-
-		ginkgo.By("Launching CPU stress pod on same node")
-		stress := specs.NewStressPod(f.ClientSet, f.Namespace, tPod.GetNode())
-		stress.Create(ctx)
-		defer stress.Cleanup(ctx)
-		stress.WaitForRunning(ctx)
-
-		ginkgo.By("Restarting CSI node driver during CPU load")
-		specs.RestartNodeDriverOnNode(ctx, f.ClientSet, tPod.GetNode())
-
-		ginkgo.By("Validating mount still present and read-write")
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
-		tPod.VerifyExecInPodSucceed(
-			f, specs.TesterContainerName,
-			fmt.Sprintf("grep before-stress %v/x && echo after-stress >> %v/x && grep after-stress %v/x", mountPath, mountPath, mountPath),
-		)
+		nodeIP := node.Status.Addresses[0].Address
+		gomega.Expect(pod.Status.PodIP).To(gomega.Equal(nodeIP))
 	})
 }

@@ -21,6 +21,8 @@ import (
 	"context"
 	"fmt"
 
+	"local/test/e2e/specs"
+
 	"github.com/google/uuid"
 	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/webhook"
 	"github.com/onsi/ginkgo/v2"
@@ -30,7 +32,6 @@ import (
 	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
 	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
 	admissionapi "k8s.io/pod-security-admission/api"
-	"local/test/e2e/specs"
 )
 
 type gcsFuseCSIFileCacheTestSuite struct {
@@ -305,5 +306,134 @@ func (t *gcsFuseCSIFileCacheTestSuite) DefineTests(driver storageframework.TestD
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v > /dev/null", mountPath, fileName))
 
 		tPod.WaitForLog(ctx, webhook.GcsFuseSidecarName, "no space left on device")
+	})
+
+	ginkgo.It("should cache multiple files and list them from mount", func() {
+		init(specs.EnableFileCachePrefix)
+		defer cleanup()
+
+		bucketName := l.config.Prefix
+		const numFiles = 5
+		fileNames := make([]string, numFiles)
+		for i := 0; i < numFiles; i++ {
+			fileNames[i] = fmt.Sprintf("multi-%s-%d", uuid.NewString(), i)
+			gcsfuseDriver.CreateTestFileInBucket(ctx, fileNames[i], bucketName)
+		}
+
+		ginkgo.By("Configuring the pod")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.SetupCacheVolumeMount("/cache")
+
+		cacheSubfolder := volumeName
+		if l.volumeResource.Pv != nil {
+			cacheSubfolder = l.volumeResource.Pv.Name
+		}
+
+		ginkgo.By("Deploying the pod")
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+
+		ginkgo.By("Checking that the pod is running")
+		tPod.WaitForRunning(ctx)
+
+		ginkgo.By("Listing and reading files from mount to populate cache")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("ls %v", mountPath))
+		for _, fileName := range fileNames {
+			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v", mountPath, fileName))
+		}
+
+		ginkgo.By("Verifying all files appear in cache and are readable")
+		for _, fileName := range fileNames {
+			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep '%v' /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", fileName, cacheSubfolder, bucketName, fileName))
+			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v | grep -q '%v'", mountPath, fileName, fileName))
+		}
+	})
+
+	ginkgo.It("should handle concurrent reads of the same file with file cache enabled", func() {
+		init(specs.EnableFileCachePrefix)
+		defer cleanup()
+
+		bucketName := l.config.Prefix
+		fileName := uuid.NewString()
+		gcsfuseDriver.CreateTestFileInBucket(ctx, fileName, bucketName)
+
+		ginkgo.By("Configuring the pod")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.SetupCacheVolumeMount("/cache")
+
+		cacheSubfolder := volumeName
+		if l.volumeResource.Pv != nil {
+			cacheSubfolder = l.volumeResource.Pv.Name
+		}
+
+		ginkgo.By("Deploying the pod")
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+
+		ginkgo.By("Checking that the pod is running")
+		tPod.WaitForRunning(ctx)
+
+		ginkgo.By("Running concurrent reads of the same file")
+		concurrentReadCmd := fmt.Sprintf("for i in 1 2 3 4 5 6 7 8 9 10; do cat %v/%v > /dev/null & done; wait", mountPath, fileName)
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, concurrentReadCmd)
+
+		ginkgo.By("Verifying file is in cache and content is correct")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep '%v' /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", fileName, cacheSubfolder, bucketName, fileName))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v | grep -q '%v'", mountPath, fileName, fileName))
+	})
+
+	ginkgo.It("should cache small files up to fileCacheCapacity", func() {
+		init(specs.EnableFileCachePrefix)
+		defer cleanup()
+
+		bucketName := l.config.Prefix
+		// fileCacheCapacity is 100Mi; use 99 files of 1MB each (99MB) to stay just under capacity
+		const numFiles = 99
+		const fileSize = 1 * 1024 * 1024 // 1MB
+		fileNames := make([]string, numFiles)
+		for i := 0; i < numFiles; i++ {
+			fileNames[i] = fmt.Sprintf("small-%s-%d", uuid.NewString(), i)
+			gcsfuseDriver.CreateTestFileWithSizeInBucket(ctx, fileNames[i], bucketName, fileSize)
+		}
+
+		ginkgo.By("Configuring the pod")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.SetupCacheVolumeMount("/cache")
+
+		cacheSubfolder := volumeName
+		if l.volumeResource.Pv != nil {
+			cacheSubfolder = l.volumeResource.Pv.Name
+		}
+
+		ginkgo.By("Deploying the pod")
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+
+		ginkgo.By("Checking that the pod is running")
+		tPod.WaitForRunning(ctx)
+
+		ginkgo.By("Reading all small files to populate cache")
+		for _, fileName := range fileNames {
+			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v > /dev/null", mountPath, fileName))
+		}
+
+		ginkgo.By("Verifying all files are in cache and readable")
+		for _, fileName := range fileNames {
+			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("test -f /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", cacheSubfolder, bucketName, fileName))
+			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v > /dev/null", mountPath, fileName))
+		}
+
+		ginkgo.By("Adding one more file to exceed cache capacity and verifying eviction behavior")
+		extraFileName := fmt.Sprintf("small-extra-%s", uuid.NewString())
+		gcsfuseDriver.CreateTestFileWithSizeInBucket(ctx, extraFileName, bucketName, fileSize)
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v > /dev/null", mountPath, extraFileName))
+		// All files (including extra) should still be readable from mount after potential eviction
+		allNames := append(fileNames, extraFileName)
+		for _, fileName := range allNames {
+			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v > /dev/null", mountPath, fileName))
+		}
 	})
 }

@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"local/test/e2e/utils"
@@ -581,6 +582,12 @@ func (n *GCSFuseCSITestDriver) CreateTestFileWithSizeInBucket(ctx context.Contex
 	n.createTestFileInBucket(ctx, fileName, bucketName, make([]byte, fileSize))
 }
 
+// OverwriteTestFileInBucket uploads content to the given object name, overwriting if it exists.
+// Use this to test cache refresh when the object in the bucket changes.
+func (n *GCSFuseCSITestDriver) OverwriteTestFileInBucket(ctx context.Context, fileName, bucketName string, content []byte) {
+	n.createTestFileInBucket(ctx, fileName, bucketName, content)
+}
+
 func (n *GCSFuseCSITestDriver) createTestFileInBucket(ctx context.Context, fileName, bucketName string, fileContent []byte) {
 	storageService, err := n.prepareStorageService(ctx)
 	if err != nil {
@@ -588,18 +595,24 @@ func (n *GCSFuseCSITestDriver) createTestFileInBucket(ctx context.Context, fileN
 		return
 	}
 
-	err = os.WriteFile(fileName, fileContent, 0o600)
+	// Use a local path without directory components so os.WriteFile succeeds when
+	// fileName is an object path like "subdir/cached-file".
+	localPath := fileName
+	if filepath.Base(fileName) != fileName {
+		localPath = filepath.Join(os.TempDir(), fmt.Sprintf("gcsfuse-e2e-%s", uuid.New().String()))
+	}
+	err = os.WriteFile(localPath, fileContent, 0o600)
 	if err != nil {
 		e2eframework.Failf("Failed to create a test file: %v", err)
 	}
 	defer func() {
-		err = os.Remove(fileName)
+		err = os.Remove(localPath)
 		if err != nil {
 			e2eframework.Failf("Failed to delete the empty data file: %v", err)
 		}
 	}()
 
-	if err := storageService.UploadGCSObject(ctx, fileName, bucketName, fileName); err != nil {
+	if err := storageService.UploadGCSObject(ctx, localPath, bucketName, fileName); err != nil {
 		e2eframework.Failf("Failed to upload test file %q to GCS bucket %q: %v", fileName, bucketName, err)
 	}
 }

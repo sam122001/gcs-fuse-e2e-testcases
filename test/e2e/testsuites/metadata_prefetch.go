@@ -575,7 +575,7 @@ func (t *gcsFuseCSIMetadataPrefetchTestSuite) DefineTests(driver storageframewor
 		ginkgo.By("Checking that the third pod is running")
 		tPod3.WaitForRunning(ctx)
 
-		ginkgo.By("Third pod sees data from both first and second pod after prefetch")
+		ginkgo.By("Metadata Visibility After External Bucket Update")
 		tPod3.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("ls %v | grep file1 && ls %v | grep file2", mountPath, mountPath))
 		tPod3.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep from-pod1 %v/file1 && grep from-pod2 %v/file2", mountPath, mountPath))
 
@@ -586,7 +586,7 @@ func (t *gcsFuseCSIMetadataPrefetchTestSuite) DefineTests(driver storageframewor
 		}
 	}
 
-	ginkgo.It("[metadata prefetch] third pod should see data from both first and second pod", func() {
+	ginkgo.It("[metadata prefetch] Metadata Visibility After External Bucket Update", func() {
 		if pattern.VolType == storageframework.DynamicPV {
 			e2eskipper.Skipf("skip for volume type %v", storageframework.DynamicPV)
 		}

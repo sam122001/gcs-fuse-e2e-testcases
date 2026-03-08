@@ -436,4 +436,92 @@ func (t *gcsFuseCSIFileCacheTestSuite) DefineTests(driver storageframework.TestD
 			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v > /dev/null", mountPath, fileName))
 		}
 	})
+
+	ginkgo.It("Cache Persistence After Pod Restart", func() {
+		init(specs.EnableFileCachePrefix)
+		defer cleanup()
+
+		bucketName := l.config.Prefix
+		fileName := uuid.NewString()
+		gcsfuseDriver.CreateTestFileInBucket(ctx, fileName, bucketName)
+
+		cacheSubfolder := volumeName
+		if l.volumeResource.Pv != nil {
+			cacheSubfolder = l.volumeResource.Pv.Name
+		}
+
+		ginkgo.By("Creating persistent cache PVC")
+		tPVC := specs.NewTestPVC(f.ClientSet, f.Namespace, "cache-persistence-pvc", "standard-rwo", "5Gi", corev1.ReadWriteOnce)
+		tPVC.Create(ctx)
+		defer tPVC.Cleanup(ctx)
+
+		ginkgo.By("Configuring the first pod with custom cache volume")
+		tPod1 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod1.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod1.SetupVolume(&storageframework.VolumeResource{Pvc: tPVC.PVC}, webhook.SidecarContainerCacheVolumeName, "", false)
+		tPod1.SetupCacheVolumeMount("/cache")
+		tPod1.SetNonRootSecurityContext(0, 0, 1000)
+
+		ginkgo.By("Deploying the first pod and populating cache")
+		tPod1.Create(ctx)
+		tPod1.WaitForRunning(ctx)
+		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v", mountPath, fileName))
+		tPod1.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep '%v' /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", fileName, cacheSubfolder, bucketName, fileName))
+
+		ginkgo.By("Restarting the pod by deleting and creating a new pod with same volumes")
+		tPod1.Cleanup(ctx)
+
+		ginkgo.By("Configuring the second pod with same volume and cache PVC")
+		tPod2 := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod2.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod2.SetupVolume(&storageframework.VolumeResource{Pvc: tPVC.PVC}, webhook.SidecarContainerCacheVolumeName, "", false)
+		tPod2.SetupCacheVolumeMount("/cache")
+		tPod2.SetNonRootSecurityContext(0, 0, 1000)
+
+		ginkgo.By("Deploying the second pod")
+		tPod2.Create(ctx)
+		defer tPod2.Cleanup(ctx)
+		tPod2.WaitForRunning(ctx)
+
+		ginkgo.By("Verifying file is readable and cache persisted from previous pod")
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v", mountPath, fileName))
+		tPod2.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep '%v' /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", fileName, cacheSubfolder, bucketName, fileName))
+	})
+
+	ginkgo.It("should not populate data cache by listing only", func() {
+		init(specs.EnableFileCachePrefix)
+		defer cleanup()
+
+		bucketName := l.config.Prefix
+		fileName := uuid.NewString()
+		gcsfuseDriver.CreateTestFileInBucket(ctx, fileName, bucketName)
+
+		ginkgo.By("Configuring the pod")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.SetupCacheVolumeMount("/cache")
+
+		cacheSubfolder := volumeName
+		if l.volumeResource.Pv != nil {
+			cacheSubfolder = l.volumeResource.Pv.Name
+		}
+
+		ginkgo.By("Deploying the pod")
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+
+		ginkgo.By("Checking that the pod is running")
+		tPod.WaitForRunning(ctx)
+
+		ginkgo.By("Listing mount without reading file and verifying file is not in data cache yet")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("ls %v", mountPath))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("test ! -f /cache/.volumes/%v/gcsfuse-file-cache/%v/%v || exit 1", cacheSubfolder, bucketName, fileName))
+
+		ginkgo.By("Reading file and verifying it is now in cache")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v", mountPath, fileName))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep '%v' /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", fileName, cacheSubfolder, bucketName, fileName))
+	})
+
 }

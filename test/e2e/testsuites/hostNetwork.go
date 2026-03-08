@@ -236,9 +236,9 @@ func (t *gcsFuseCSIHostNetworkTestSuite) DefineTests(
 	})
 
 	// ----------------------------------------------------------------------
-	// ⭐ HN-7: STS/IAM latency validation over hostNetwork
+	// ⭐ HN-6: STS/IAM latency validation over hostNetwork
 	// ----------------------------------------------------------------------
-	ginkgo.It("[HN-7] should successfully call STS/IAM APIs with reasonable latency over hostNetwork", func() {
+	ginkgo.It("[HN-6] should successfully call STS/IAM APIs with reasonable latency over hostNetwork", func() {
 		init()
 		defer cleanup()
 
@@ -260,7 +260,7 @@ func (t *gcsFuseCSIHostNetworkTestSuite) DefineTests(
 		gomega.Expect(lsec).To(gomega.BeNumerically("<", 20), "STS call should complete within 20s")
 	})
 
-	ginkgo.It("[HN-8] should share node network namespace when hostNetwork=true", func() {
+	ginkgo.It("[HN-7] should share node network namespace when hostNetwork=true", func() {
 		init()
 		defer cleanup()
 

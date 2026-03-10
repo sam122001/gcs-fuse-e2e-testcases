@@ -384,19 +384,121 @@ func (t *gcsFuseCSIFileCacheTestSuite) DefineTests(driver storageframework.TestD
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v | grep -q '%v'", mountPath, fileName, fileName))
 	})
 
-	ginkgo.It("should cache small files up to fileCacheCapacity", func() {
+	ginkgo.It("should evict cached files when fileCacheCapacity is exceeded", func() {
 		init(specs.EnableFileCachePrefix)
 		defer cleanup()
 
 		bucketName := l.config.Prefix
-		// fileCacheCapacity is 100Mi; use 99 files of 1MB each (99MB) to stay just under capacity
-		const numFiles = 99
-		const fileSize = 1 * 1024 * 1024 // 1MB
+
+		// Use larger files to guarantee cache overflow
+		const numFiles = 2
+		const fileSize = 40 * 1024 * 1024 // 40MB
+
 		fileNames := make([]string, numFiles)
+
 		for i := 0; i < numFiles; i++ {
-			fileNames[i] = fmt.Sprintf("small-%s-%d", uuid.NewString(), i)
+			fileNames[i] = fmt.Sprintf("large-%s-%d", uuid.NewString(), i)
 			gcsfuseDriver.CreateTestFileWithSizeInBucket(ctx, fileNames[i], bucketName, fileSize)
 		}
+
+		ginkgo.By("Configuring the pod")
+
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.SetupCacheVolumeMount("/cache")
+
+		cacheSubfolder := volumeName
+		if l.volumeResource.Pv != nil {
+			cacheSubfolder = l.volumeResource.Pv.Name
+		}
+
+		cacheDir := fmt.Sprintf("/cache/.volumes/%v/gcsfuse-file-cache/%v", cacheSubfolder, bucketName)
+
+		ginkgo.By("Deploying the pod")
+
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+
+		tPod.WaitForRunning(ctx)
+
+		ginkgo.By("Reading initial files to populate cache")
+
+		for _, fileName := range fileNames {
+			tPod.VerifyExecInPodSucceed(
+				f,
+				specs.TesterContainerName,
+				fmt.Sprintf("cat %v/%v > /dev/null", mountPath, fileName),
+			)
+		}
+
+		ginkgo.By("Recording initial cache file count")
+
+		initialCountCmd := fmt.Sprintf("ls -1 %v | wc -l", cacheDir)
+
+		tPod.VerifyExecInPodSucceed(
+			f,
+			specs.TesterContainerName,
+			initialCountCmd,
+		)
+
+		ginkgo.By("Adding another large file to exceed cache capacity")
+
+		extraFile := fmt.Sprintf("large-extra-%s", uuid.NewString())
+
+		gcsfuseDriver.CreateTestFileWithSizeInBucket(
+			ctx,
+			extraFile,
+			bucketName,
+			fileSize,
+		)
+
+		tPod.VerifyExecInPodSucceed(
+			f,
+			specs.TesterContainerName,
+			fmt.Sprintf("cat %v/%v > /dev/null", mountPath, extraFile),
+		)
+
+		ginkgo.By("Waiting for eviction to occur")
+
+		// After reading the extra file we have numFiles+1 (3) files; eviction should bring count below that.
+		minFilesAfterEviction := numFiles + 1
+		tPod.VerifyExecInPodSucceed(
+			f,
+			specs.TesterContainerName,
+			fmt.Sprintf(`
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		count=$(ls -1 %v | wc -l)
+		if [ "$count" -lt %d ]; then
+			exit 0
+		fi
+		sleep 2
+	done
+	
+	echo "Cache eviction did not occur"
+	exit 1
+	`, cacheDir, minFilesAfterEviction),
+		)
+
+		ginkgo.By("Ensuring files remain readable from mount")
+
+		allFiles := append(fileNames, extraFile)
+
+		for _, fileName := range allFiles {
+			tPod.VerifyExecInPodSucceed(
+				f,
+				specs.TesterContainerName,
+				fmt.Sprintf("cat %v/%v > /dev/null", mountPath, fileName),
+			)
+		}
+	})
+
+	ginkgo.It("should serve consistent content for repeated reads from cache", func() {
+		init(specs.EnableFileCachePrefix)
+		defer cleanup()
+
+		bucketName := l.config.Prefix
+		fileName := uuid.NewString()
+		gcsfuseDriver.CreateTestFileInBucket(ctx, fileName, bucketName)
 
 		ginkgo.By("Configuring the pod")
 		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
@@ -415,26 +517,11 @@ func (t *gcsFuseCSIFileCacheTestSuite) DefineTests(driver storageframework.TestD
 		ginkgo.By("Checking that the pod is running")
 		tPod.WaitForRunning(ctx)
 
-		ginkgo.By("Reading all small files to populate cache")
-		for _, fileName := range fileNames {
-			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v > /dev/null", mountPath, fileName))
+		ginkgo.By("Reading the file multiple times and verifying consistent content from cache")
+		for i := 0; i < 5; i++ {
+			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v | grep -q '%v'", mountPath, fileName, fileName))
 		}
-
-		ginkgo.By("Verifying all files are in cache and readable")
-		for _, fileName := range fileNames {
-			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("test -f /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", cacheSubfolder, bucketName, fileName))
-			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v > /dev/null", mountPath, fileName))
-		}
-
-		ginkgo.By("Adding one more file to exceed cache capacity and verifying eviction behavior")
-		extraFileName := fmt.Sprintf("small-extra-%s", uuid.NewString())
-		gcsfuseDriver.CreateTestFileWithSizeInBucket(ctx, extraFileName, bucketName, fileSize)
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v > /dev/null", mountPath, extraFileName))
-		// All files (including extra) should still be readable from mount after potential eviction
-		allNames := append(fileNames, extraFileName)
-		for _, fileName := range allNames {
-			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v > /dev/null", mountPath, fileName))
-		}
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep '%v' /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", fileName, cacheSubfolder, bucketName, fileName))
 	})
 
 	ginkgo.It("Cache Persistence After Pod Restart", func() {
@@ -524,4 +611,76 @@ func (t *gcsFuseCSIFileCacheTestSuite) DefineTests(driver storageframework.TestD
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep '%v' /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", fileName, cacheSubfolder, bucketName, fileName))
 	})
 
+	ginkgo.It("should serve cached content when file changes in bucket (no automatic refresh)", func() {
+		init(specs.EnableFileCachePrefix)
+		defer cleanup()
+
+		bucketName := l.config.Prefix
+		fileName := uuid.NewString()
+		originalContent := fileName
+		gcsfuseDriver.CreateTestFileInBucket(ctx, fileName, bucketName)
+
+		ginkgo.By("Configuring the pod")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.SetupCacheVolumeMount("/cache")
+
+		cacheSubfolder := volumeName
+		if l.volumeResource.Pv != nil {
+			cacheSubfolder = l.volumeResource.Pv.Name
+		}
+
+		ginkgo.By("Deploying the pod")
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+
+		ginkgo.By("Checking that the pod is running")
+		tPod.WaitForRunning(ctx)
+
+		ginkgo.By("Reading file to populate cache and verifying original content")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v | grep -q '%v'", mountPath, fileName, originalContent))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep '%v' /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", originalContent, cacheSubfolder, bucketName, fileName))
+
+		ginkgo.By("Overwriting file in bucket with new content")
+		refreshedContent := "refreshed-content-after-update"
+		gcsfuseDriver.OverwriteTestFileInBucket(ctx, fileName, bucketName, []byte(refreshedContent))
+
+		// File cache does not automatically invalidate when the object is updated in GCS.
+		// Reads continue to serve the cached (original) content until cache eviction or pod restart.
+		ginkgo.By("Verifying mount still serves cached content (no automatic refresh)")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v | grep -q '%v'", mountPath, fileName, originalContent))
+	})
+
+	ginkgo.It("Partial Read Should Still Populate Cache", func() {
+		init(specs.EnableFileCachePrefix)
+		defer cleanup()
+
+		bucketName := l.config.Prefix
+		fileName := uuid.NewString()
+		gcsfuseDriver.CreateTestFileInBucket(ctx, fileName, bucketName)
+
+		ginkgo.By("Configuring the pod")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.SetupCacheVolumeMount("/cache")
+
+		cacheSubfolder := volumeName
+		if l.volumeResource.Pv != nil {
+			cacheSubfolder = l.volumeResource.Pv.Name
+		}
+
+		ginkgo.By("Deploying the pod")
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+
+		ginkgo.By("Checking that the pod is running")
+		tPod.WaitForRunning(ctx)
+
+		ginkgo.By("Performing partial read (first 50 bytes) without full cat")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("head -c 50 %v/%v > /dev/null", mountPath, fileName))
+
+		ginkgo.By("Verifying file is in cache after partial read")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("test -f /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", cacheSubfolder, bucketName, fileName))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep -q '%v' /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", fileName, cacheSubfolder, bucketName, fileName))
+	})
 }

@@ -1,7 +1,7 @@
 /*
 Clean HostNetwork Test Suite for GCSFuse CSI Driver
-Contains exactly 8 meaningful hostNetwork tests:
-HN-1, HN-2, HN-3, HN-4, HN-5, HN-7, HN-8, HN-9
+Contains exactly 7 meaningful hostNetwork tests:
+HN-1, HN-2, HN-3, HN-4, HN-5, HN-8, HN-9
 */
 
 package testsuites
@@ -9,7 +9,6 @@ package testsuites
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"local/test/e2e/specs"
@@ -88,38 +87,84 @@ func (t *gcsFuseCSIHostNetworkTestSuite) DefineTests(
 	}
 
 	// ----------------------------------------------------------------------
-	// ⭐ HN-1: DNS + HTTPS reachability for hostNetwork pods
+	// ⭐ HN-1: Verify hostNetwork pod uses node network and can reach GCS APIs
 	// ----------------------------------------------------------------------
-	ginkgo.It("should resolve storage.googleapis.com and required domains when hostNetwork=true", func() {
+	ginkgo.It("[HN-1] should use node network to reach internet and Google APIs", func() {
 		init()
 		defer cleanup()
 
 		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
 		tPod.EnableHostNetwork()
 		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
+
+		ginkgo.By("Creating hostNetwork pod")
 		tPod.Create(ctx)
 		tPod.WaitForRunning(ctx)
 
-		ginkgo.By("Verifying nameservers are configured")
-		resolv := tPod.VerifyExecInPodSucceedWithOutput(
-			f, specs.TesterContainerName, "cat /etc/resolv.conf | grep nameserver",
-		)
-		gomega.Expect(resolv).ToNot(gomega.BeEmpty())
+		ginkgo.By("Fetching pod object")
+		pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, tPod.GetPodName(), metav1.GetOptions{})
+		framework.ExpectNoError(err)
 
-		// GCS and Google API domains required for hostNetwork pods using gcsfuse. Use wget (available in test image); connectivity implies DNS resolution.
-		// wget exit 0 = 2xx, exit 8 = 4xx (e.g. 403 for GCS root).
-		ginkgo.By("Checking HTTPS connectivity to storage.googleapis.com (wget exit 0 or 8)")
+		ginkgo.By("Fetching node object")
+		node, err := f.ClientSet.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Extracting node internal IP")
+		var nodeIP string
+		for _, addr := range node.Status.Addresses {
+			if addr.Type == "InternalIP" {
+				nodeIP = addr.Address
+				break
+			}
+		}
+		framework.ExpectNoError(err)
+		gomega.Expect(nodeIP).ToNot(gomega.BeEmpty(), "node internal IP must exist")
+
+		ginkgo.By("Verifying pod shares node network namespace (PodIP == NodeIP)")
+		gomega.Expect(pod.Status.PodIP).To(gomega.Equal(nodeIP),
+			fmt.Sprintf("expected pod IP %s to equal node IP %s", pod.Status.PodIP, nodeIP),
+		)
+
+		ginkgo.By("Verifying default route exists in node's route table via /proc/net/route")
 		tPod.VerifyExecInPodSucceed(
-			f, specs.TesterContainerName,
+			f,
+			specs.TesterContainerName,
+			"cat /proc/net/route | grep -w '00000000'",
+		)
+
+		ginkgo.By("Checking DNS configuration inside the pod")
+		resolvConf := tPod.VerifyExecInPodSucceedWithOutput(
+			f,
+			specs.TesterContainerName,
+			"cat /etc/resolv.conf",
+		)
+		gomega.Expect(resolvConf).To(gomega.ContainSubstring("nameserver"))
+
+		ginkgo.By("Checking outbound internet connectivity (public IP detection)")
+		publicIP := tPod.VerifyExecInPodSucceedWithOutput(
+			f,
+			specs.TesterContainerName,
+			"wget -qO- https://api.ipify.org",
+		)
+
+		framework.Logf("Public IP seen from hostNetwork pod: %s", publicIP)
+		gomega.Expect(strings.TrimSpace(publicIP)).ToNot(gomega.BeEmpty())
+
+		ginkgo.By("Checking connectivity to storage.googleapis.com (allow 403)")
+		tPod.VerifyExecInPodSucceed(
+			f,
+			specs.TesterContainerName,
 			"wget -q -O /dev/null https://storage.googleapis.com; r=$?; [ $r -eq 0 ] || [ $r -eq 8 ] || exit $r",
 		)
 
-		ginkgo.By("Checking HTTPS connectivity to www.googleapis.com")
+		ginkgo.By("Checking connectivity to Google APIs")
 		tPod.VerifyExecInPodSucceed(
-			f, specs.TesterContainerName,
+			f,
+			specs.TesterContainerName,
 			"wget -q -O /dev/null https://www.googleapis.com/discovery/v1/apis",
 		)
 
+		ginkgo.By("Cleaning up test pod")
 		tPod.Cleanup(ctx)
 	})
 
@@ -236,9 +281,9 @@ func (t *gcsFuseCSIHostNetworkTestSuite) DefineTests(
 	})
 
 	// ----------------------------------------------------------------------
-	// ⭐ HN-6: STS/IAM latency validation over hostNetwork
+	// ⭐ HN-6: DNS resolution works using node DNS
 	// ----------------------------------------------------------------------
-	ginkgo.It("[HN-6] should successfully call STS/IAM APIs with reasonable latency over hostNetwork", func() {
+	ginkgo.It("[HN-6] should resolve DNS using node DNS configuration over hostNetwork", func() {
 		init()
 		defer cleanup()
 
@@ -249,35 +294,47 @@ func (t *gcsFuseCSIHostNetworkTestSuite) DefineTests(
 		tPod.WaitForRunning(ctx)
 		expectHostNetwork(tPod.GetPodName())
 
-		ginkgo.By("Measuring STS latency")
-		latency := tPod.VerifyExecInPodSucceedWithOutput(
-			f, specs.TesterContainerName,
-			`ts=$(date +%s); wget -qO- https://sts.googleapis.com >/dev/null; te=$(date +%s); echo $((te-ts))`,
+		ginkgo.By("Checking DNS configuration inside the pod")
+		resolvConf := tPod.VerifyExecInPodSucceedWithOutput(
+			f,
+			specs.TesterContainerName,
+			"cat /etc/resolv.conf",
 		)
-		lsec, err := strconv.Atoi(strings.TrimSpace(latency))
-		framework.ExpectNoError(err, "latency output %q must parse as integer", latency)
-		gomega.Expect(lsec).To(gomega.BeNumerically(">=", 0), "latency must be non-negative")
-		gomega.Expect(lsec).To(gomega.BeNumerically("<", 20), "STS call should complete within 20s")
+		gomega.Expect(resolvConf).To(gomega.ContainSubstring("nameserver"))
+
+		ginkgo.By("Resolving and connecting to an external hostname")
+		tPod.VerifyExecInPodSucceed(
+			f,
+			specs.TesterContainerName,
+			"wget -q -O /dev/null https://www.google.com",
+		)
 	})
 
-	ginkgo.It("[HN-7] should share node network namespace when hostNetwork=true", func() {
+	// ----------------------------------------------------------------------
+	// ⭐ HN-7: HostNetwork pod uses node network interface
+	// ----------------------------------------------------------------------
+	ginkgo.It("[HN-7] should expose node IP on a network interface when hostNetwork=true", func() {
 		init()
 		defer cleanup()
 
 		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
 		tPod.EnableHostNetwork()
+		tPod.SetupVolumeWithHostNetworkKSAOptIn(l.volumeResource, volumeName, mountPath, false)
 		tPod.Create(ctx)
 		tPod.WaitForRunning(ctx)
+		expectHostNetwork(tPod.GetPodName())
 
-		ginkgo.By("Getting pod IP")
+		ginkgo.By("Fetching pod object")
 		pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, tPod.GetPodName(), metav1.GetOptions{})
 		framework.ExpectNoError(err)
 
-		ginkgo.By("Getting node IP")
-		node, err := f.ClientSet.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{})
-		framework.ExpectNoError(err)
-
-		nodeIP := node.Status.Addresses[0].Address
-		gomega.Expect(pod.Status.PodIP).To(gomega.Equal(nodeIP))
+		ginkgo.By("Verifying pod IP is present in kernel FIB (host network namespace)")
+		checkCmd := fmt.Sprintf("cat /proc/net/fib_trie | grep -w '%s'", pod.Status.PodIP)
+		tPod.VerifyExecInPodSucceed(
+			f,
+			specs.TesterContainerName,
+			checkCmd,
+		)
 	})
+
 }

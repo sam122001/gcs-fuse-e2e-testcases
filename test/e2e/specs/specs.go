@@ -102,12 +102,11 @@ const (
 	GolangImage         = "golang:1.22.7"
 	UbuntuImage         = "ubuntu:20.04"
 
-	LastPublishedSidecarContainerImage = "gcr.io/gke-release/gcs-fuse-csi-driver-sidecar-mounter:v1.7.1-gke.3@sha256:380bd2a716b936d9469d09e3a83baf22dddca1586a04a0060d7006ea78930cac"
-
-	pollInterval     = 1 * time.Second
-	pollTimeout      = 1 * time.Minute
-	pollIntervalSlow = 10 * time.Second
-	pollTimeoutSlow  = 20 * time.Minute
+	LastPublishedSidecarContainerImage = "gcr.io/gke-release/gcs-fuse-csi-driver-sidecar-mounter:v1.17.9-gke.1"
+	pollInterval                       = 1 * time.Second
+	pollTimeout                        = 1 * time.Minute
+	pollIntervalSlow                   = 10 * time.Second
+	pollTimeoutSlow                    = 20 * time.Minute
 
 	backoffDuration = 5 * time.Second
 	backoffFactor   = 2.0
@@ -1361,7 +1360,7 @@ func NewStressPod(c clientset.Interface, ns *corev1.Namespace, nodeName string) 
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,
-			NodeName:     nodeName,
+			NodeName:      nodeName,
 			Containers: []corev1.Container{
 				{
 					Name:    "stress",

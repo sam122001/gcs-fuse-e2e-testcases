@@ -15,12 +15,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# For GCE BYO K8s: set E2E_GCP_PROJECT to your GCP project ID and optionally
+# E2E_CLUSTER_REGION (default: us-central1), E2E_CLUSTER_NAME (default: byo-cluster).
+# Also use: E2E_TEST_SKIP_CSI_DRIVER_INSTALL=true and E2E_TEST_USE_GKE_MANAGED_DRIVER=false
+# if the driver is already installed. Ensure Workload Identity or pod GCS auth is configured.
+
 set -o xtrace
 set -o nounset
 set -o errexit
 
 readonly PKGDIR=$(realpath "$( dirname -- "$0"; )/../..")
 readonly gke_cluster_region=${GKE_CLUSTER_REGION:-us-central1}
+# When running on BYO K8s (E2E_GCP_PROJECT set), align metadata region with test-bucket-location.
+if [ -n "${E2E_GCP_PROJECT:-}" ]; then
+  export E2E_CLUSTER_REGION=${E2E_CLUSTER_REGION:-$gke_cluster_region}
+  export E2E_CLUSTER_NAME=${E2E_CLUSTER_NAME:-byo-cluster}
+fi
 readonly gke_cluster_version=$(kubectl version 2>/dev/null | grep 'Server Version:' | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+(-gke\.[0-9]+)?$')
 readonly gke_release_channel=${GKE_RELEASE_CHANNEL:-rapid}
 readonly use_gke_autopilot=${E2E_TEST_USE_GKE_AUTOPILOT:-false}

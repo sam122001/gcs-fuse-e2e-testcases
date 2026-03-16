@@ -379,7 +379,7 @@ func (t *gcsFuseCSIFileCacheTestSuite) DefineTests(driver storageframework.TestD
 		concurrentReadCmd := fmt.Sprintf("for i in 1 2 3 4 5 6 7 8 9 10; do cat %v/%v > /dev/null & done; wait", mountPath, fileName)
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, concurrentReadCmd)
 
-		ginkgo.By("Verifying file is in cache and content is correct")
+		ginkgo.By("Verifying file is in cache")
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep '%v' /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", fileName, cacheSubfolder, bucketName, fileName))
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v | grep -q '%v'", mountPath, fileName, fileName))
 	})
@@ -392,7 +392,7 @@ func (t *gcsFuseCSIFileCacheTestSuite) DefineTests(driver storageframework.TestD
 
 		// Use larger files to guarantee cache overflow
 		const numFiles = 2
-		const fileSize = 40 * 1024 * 1024 // 40MB
+		const fileSize = 40 * 1024 * 1024
 
 		fileNames := make([]string, numFiles)
 
@@ -492,38 +492,6 @@ func (t *gcsFuseCSIFileCacheTestSuite) DefineTests(driver storageframework.TestD
 		}
 	})
 
-	ginkgo.It("should serve consistent content for repeated reads from cache", func() {
-		init(specs.EnableFileCachePrefix)
-		defer cleanup()
-
-		bucketName := l.config.Prefix
-		fileName := uuid.NewString()
-		gcsfuseDriver.CreateTestFileInBucket(ctx, fileName, bucketName)
-
-		ginkgo.By("Configuring the pod")
-		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
-		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
-		tPod.SetupCacheVolumeMount("/cache")
-
-		cacheSubfolder := volumeName
-		if l.volumeResource.Pv != nil {
-			cacheSubfolder = l.volumeResource.Pv.Name
-		}
-
-		ginkgo.By("Deploying the pod")
-		tPod.Create(ctx)
-		defer tPod.Cleanup(ctx)
-
-		ginkgo.By("Checking that the pod is running")
-		tPod.WaitForRunning(ctx)
-
-		ginkgo.By("Reading the file multiple times and verifying consistent content from cache")
-		for i := 0; i < 5; i++ {
-			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v | grep -q '%v'", mountPath, fileName, fileName))
-		}
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep '%v' /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", fileName, cacheSubfolder, bucketName, fileName))
-	})
-
 	ginkgo.It("Cache Persistence After Pod Restart", func() {
 		init(specs.EnableFileCachePrefix)
 		defer cleanup()
@@ -608,6 +576,38 @@ func (t *gcsFuseCSIFileCacheTestSuite) DefineTests(driver storageframework.TestD
 
 		ginkgo.By("Reading file and verifying it is now in cache")
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v", mountPath, fileName))
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep '%v' /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", fileName, cacheSubfolder, bucketName, fileName))
+	})
+
+	ginkgo.It("should serve consistent content for repeated reads from cache", func() {
+		init(specs.EnableFileCachePrefix)
+		defer cleanup()
+
+		bucketName := l.config.Prefix
+		fileName := uuid.NewString()
+		gcsfuseDriver.CreateTestFileInBucket(ctx, fileName, bucketName)
+
+		ginkgo.By("Configuring the pod")
+		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		tPod.SetupCacheVolumeMount("/cache")
+
+		cacheSubfolder := volumeName
+		if l.volumeResource.Pv != nil {
+			cacheSubfolder = l.volumeResource.Pv.Name
+		}
+
+		ginkgo.By("Deploying the pod")
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+
+		ginkgo.By("Checking that the pod is running")
+		tPod.WaitForRunning(ctx)
+
+		ginkgo.By("Reading the file multiple times and verifying consistent content from cache")
+		for i := 0; i < 5; i++ {
+			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("cat %v/%v | grep -q '%v'", mountPath, fileName, fileName))
+		}
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("grep '%v' /cache/.volumes/%v/gcsfuse-file-cache/%v/%v", fileName, cacheSubfolder, bucketName, fileName))
 	})
 

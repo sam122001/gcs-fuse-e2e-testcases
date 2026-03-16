@@ -82,11 +82,28 @@ var _ = func() bool {
 
 	currentCluster := kubeConfig.CurrentContext
 	framework.Logf("Running test on cluster %s", currentCluster)
-	l := strings.Split(currentCluster, "_")
-	if len(l) < 4 || l[0] != "gke" {
-		klog.Fatalf("Got invalid cluster name %v, please make sure the cluster is created on GKE", currentCluster)
+
+	// BYO K8s (e.g. GCE VM): set E2E_GCP_PROJECT (and optionally E2E_CLUSTER_REGION, E2E_CLUSTER_NAME)
+	// to use a non-GKE context. Otherwise the context must be GKE format: gke_PROJECT_REGION_CLUSTER.
+	gcpProject := os.Getenv("E2E_GCP_PROJECT")
+	if gcpProject != "" {
+		clusterRegion := os.Getenv("E2E_CLUSTER_REGION")
+		if clusterRegion == "" {
+			clusterRegion = "us-central1"
+		}
+		clusterName := os.Getenv("E2E_CLUSTER_NAME")
+		if clusterName == "" {
+			clusterName = "byo-cluster"
+		}
+		framework.Logf("BYO K8s mode: project=%s region=%s cluster=%s", gcpProject, clusterRegion, clusterName)
+		m, err = metadata.NewFakeService(gcpProject, clusterRegion, clusterName, *apiEnv)
+	} else {
+		l := strings.Split(currentCluster, "_")
+		if len(l) < 4 || l[0] != "gke" {
+			klog.Fatalf("Got invalid cluster name %v. Use GKE context (gke_PROJECT_REGION_CLUSTER) or set E2E_GCP_PROJECT for BYO K8s", currentCluster)
+		}
+		m, err = metadata.NewFakeService(l[1], l[2], l[3], *apiEnv)
 	}
-	m, err = metadata.NewFakeService(l[1], l[2], l[3], *apiEnv)
 	if err != nil {
 		klog.Fatalf("Failed to create fake meta data service: %v", err)
 	}

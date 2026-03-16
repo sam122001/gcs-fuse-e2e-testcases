@@ -464,6 +464,14 @@ func (n *GCSFuseCSITestDriver) prepareStorageService(ctx context.Context) (stora
 
 // SetIAMPolicy sets IAM policy for the GCS bucket.
 func (n *GCSFuseCSITestDriver) SetIAMPolicy(ctx context.Context, bucket *storage.ServiceBucket, serviceAccountNamespace, serviceAccountName string) {
+	// In BYO K8s mode without Workload Identity, assume the cluster's existing
+	// identity already has access to GCS and skip adding a WI-style binding
+	// that would fail when the identity pool does not exist.
+	if os.Getenv("E2E_GCP_PROJECT") != "" && os.Getenv("E2E_USE_WORKLOAD_IDENTITY") == "" {
+		e2eframework.Logf("BYO K8s mode without Workload Identity; skipping bucket IAM binding for %q", bucket.Name)
+		return
+	}
+
 	storageService, err := n.prepareStorageService(ctx)
 	if err != nil {
 		e2eframework.Failf("Failed to prepare storage service: %v", err)
@@ -480,6 +488,13 @@ func (n *GCSFuseCSITestDriver) SetIAMPolicy(ctx context.Context, bucket *storage
 
 // RemoveIAMPolicy removes IAM policy from the GCS bucket.
 func (n *GCSFuseCSITestDriver) RemoveIAMPolicy(ctx context.Context, bucket *storage.ServiceBucket, serviceAccountNamespace, serviceAccountName string) {
+	// Match SetIAMPolicy behaviour: when we skip adding bindings in BYO mode,
+	// there is nothing to remove.
+	if os.Getenv("E2E_GCP_PROJECT") != "" && os.Getenv("E2E_USE_WORKLOAD_IDENTITY") == "" {
+		e2eframework.Logf("BYO K8s mode without Workload Identity; skipping bucket IAM unbinding for %q", bucket.Name)
+		return
+	}
+
 	storageService, err := n.prepareStorageService(ctx)
 	if err != nil {
 		e2eframework.Failf("Failed to prepare storage service: %v", err)
